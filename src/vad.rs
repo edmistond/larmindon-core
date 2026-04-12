@@ -688,11 +688,10 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // VadProcessor integration tests (require ONNX model)
+    // VadProcessor integration tests (use bundled ONNX model)
     // -----------------------------------------------------------------------
 
     #[test]
-    #[ignore] // Requires silero_vad.onnx model file
     fn vad_processor_silence_stays_silent() {
         let model_path = concat!(env!("CARGO_MANIFEST_DIR"), "/models/silero_vad.onnx");
         let mut vad = VadProcessor::new(Path::new(model_path), 0.5, 0.3, 500, 250, 500)
@@ -711,7 +710,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // Requires silero_vad.onnx model file
     fn vad_processor_tone_triggers_speech() {
         let model_path = concat!(env!("CARGO_MANIFEST_DIR"), "/models/silero_vad.onnx");
         let mut vad = VadProcessor::new(Path::new(model_path), 0.5, 0.3, 500, 250, 500)
@@ -743,7 +741,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // Requires silero_vad.onnx model file
     fn vad_processor_reset_returns_to_silence() {
         let model_path = concat!(env!("CARGO_MANIFEST_DIR"), "/models/silero_vad.onnx");
         let mut vad = VadProcessor::new(Path::new(model_path), 0.5, 0.3, 500, 250, 500)
