@@ -114,3 +114,96 @@ pub mod pipewire;
 
 #[cfg(feature = "cpal")]
 pub mod cpal;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_device(id: &str, device_type: DeviceType, is_default: bool) -> AudioDevice {
+        AudioDevice {
+            id: id.to_string(),
+            name: id.to_string(),
+            device_type,
+            is_default,
+            application_name: None,
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // select_default_device tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn select_default_prefers_default_monitor() {
+        let devices = vec![
+            make_device("input1", DeviceType::Input, true),
+            make_device("monitor1", DeviceType::Monitor, false),
+            make_device("monitor2", DeviceType::Monitor, true),
+        ];
+        assert_eq!(select_default_device(&devices), Some("monitor2".into()));
+    }
+
+    #[test]
+    fn select_default_falls_back_to_any_monitor() {
+        let devices = vec![
+            make_device("input1", DeviceType::Input, true),
+            make_device("monitor1", DeviceType::Monitor, false),
+        ];
+        assert_eq!(select_default_device(&devices), Some("monitor1".into()));
+    }
+
+    #[test]
+    fn select_default_falls_back_to_input() {
+        let devices = vec![
+            make_device("input1", DeviceType::Input, false),
+            make_device("app1", DeviceType::Application, false),
+        ];
+        assert_eq!(select_default_device(&devices), Some("input1".into()));
+    }
+
+    #[test]
+    fn select_default_returns_none_for_only_apps() {
+        let devices = vec![make_device("app1", DeviceType::Application, false)];
+        assert_eq!(select_default_device(&devices), None);
+    }
+
+    #[test]
+    fn select_default_returns_none_for_empty_list() {
+        assert_eq!(select_default_device(&[]), None);
+    }
+
+    // -----------------------------------------------------------------------
+    // sort_devices_by_priority tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn sort_orders_application_input_monitor() {
+        let devices = vec![
+            make_device("monitor1", DeviceType::Monitor, false),
+            make_device("input1", DeviceType::Input, false),
+            make_device("app1", DeviceType::Application, false),
+        ];
+        let sorted = sort_devices_by_priority(devices);
+        assert_eq!(sorted[0].id, "app1");
+        assert_eq!(sorted[1].id, "input1");
+        assert_eq!(sorted[2].id, "monitor1");
+    }
+
+    #[test]
+    fn sort_preserves_order_within_same_type() {
+        let devices = vec![
+            make_device("input2", DeviceType::Input, false),
+            make_device("input1", DeviceType::Input, true),
+        ];
+        let sorted = sort_devices_by_priority(devices);
+        // Both are Input, original order preserved (stable sort)
+        assert_eq!(sorted[0].id, "input2");
+        assert_eq!(sorted[1].id, "input1");
+    }
+
+    #[test]
+    fn sort_empty_list() {
+        let sorted = sort_devices_by_priority(vec![]);
+        assert!(sorted.is_empty());
+    }
+}

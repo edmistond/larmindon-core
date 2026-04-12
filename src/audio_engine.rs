@@ -820,3 +820,63 @@ pub fn ends_with_sentence_punctuation(text: &str) -> bool {
         _ => false,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn period_is_sentence_punctuation() {
+        assert!(ends_with_sentence_punctuation("Hello."));
+    }
+
+    #[test]
+    fn question_mark_is_sentence_punctuation() {
+        assert!(ends_with_sentence_punctuation("Hello?"));
+    }
+
+    #[test]
+    fn exclamation_is_sentence_punctuation() {
+        assert!(ends_with_sentence_punctuation("Hello!"));
+    }
+
+    #[test]
+    fn ellipsis_is_not_sentence_punctuation() {
+        assert!(!ends_with_sentence_punctuation("Hello..."));
+    }
+
+    #[test]
+    fn digit_before_period_is_not_sentence_punctuation() {
+        assert!(!ends_with_sentence_punctuation("3."));
+        assert!(!ends_with_sentence_punctuation("The value is 3.14."));
+    }
+
+    #[test]
+    fn word_before_period_is_sentence_punctuation() {
+        assert!(ends_with_sentence_punctuation("end."));
+        assert!(ends_with_sentence_punctuation("The end."));
+    }
+
+    #[test]
+    fn empty_string_is_not_sentence_punctuation() {
+        assert!(!ends_with_sentence_punctuation(""));
+    }
+
+    #[test]
+    fn whitespace_only_is_not_sentence_punctuation() {
+        assert!(!ends_with_sentence_punctuation("   "));
+    }
+
+    #[test]
+    fn trailing_whitespace_is_trimmed() {
+        assert!(ends_with_sentence_punctuation("Hello.  "));
+        assert!(ends_with_sentence_punctuation("Hello?  "));
+    }
+
+    #[test]
+    fn no_punctuation_is_not_sentence_ending() {
+        assert!(!ends_with_sentence_punctuation("Hello"));
+        assert!(!ends_with_sentence_punctuation("Hello,"));
+        assert!(!ends_with_sentence_punctuation("Hello;"));
+    }
+}

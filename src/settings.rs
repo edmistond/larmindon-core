@@ -229,3 +229,156 @@ pub fn expand_tilde(path: &str) -> PathBuf {
 pub fn chunk_ms_to_samples(ms: usize) -> usize {
     16000 * ms / 1000
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_settings_are_valid() {
+        let settings = Settings::default();
+        assert!(settings.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_invalid_chunk_ms() {
+        let mut s = Settings::default();
+        s.chunk_ms = 999;
+        assert!(s.validate().is_err());
+        assert!(s.validate().unwrap_err().contains("chunk_ms"));
+    }
+
+    #[test]
+    fn validate_accepts_all_valid_chunk_ms() {
+        for &ms in &[80, 160, 560, 1120] {
+            let mut s = Settings::default();
+            s.chunk_ms = ms;
+            assert!(s.validate().is_ok(), "chunk_ms={} should be valid", ms);
+        }
+    }
+
+    #[test]
+    fn validate_rejects_zero_intra_threads() {
+        let mut s = Settings::default();
+        s.intra_threads = 0;
+        assert!(s.validate().is_err());
+        assert!(s.validate().unwrap_err().contains("intra_threads"));
+    }
+
+    #[test]
+    fn validate_rejects_zero_inter_threads() {
+        let mut s = Settings::default();
+        s.inter_threads = 0;
+        assert!(s.validate().is_err());
+        assert!(s.validate().unwrap_err().contains("inter_threads"));
+    }
+
+    #[test]
+    fn validate_rejects_zero_empty_reset_threshold() {
+        let mut s = Settings::default();
+        s.empty_reset_threshold = 0;
+        assert!(s.validate().is_err());
+        assert!(s.validate().unwrap_err().contains("empty_reset_threshold"));
+    }
+
+    #[test]
+    fn validate_rejects_empty_model_path() {
+        let mut s = Settings::default();
+        s.model_path = "   ".to_string();
+        assert!(s.validate().is_err());
+        assert!(s.validate().unwrap_err().contains("model_path"));
+    }
+
+    #[test]
+    fn validate_rejects_invalid_theme_mode() {
+        let mut s = Settings::default();
+        s.theme_mode = "neon".to_string();
+        assert!(s.validate().is_err());
+        assert!(s.validate().unwrap_err().contains("theme_mode"));
+    }
+
+    #[test]
+    fn validate_accepts_all_valid_themes() {
+        for theme in &["light", "dark", "system"] {
+            let mut s = Settings::default();
+            s.theme_mode = theme.to_string();
+            assert!(s.validate().is_ok(), "theme '{}' should be valid", theme);
+        }
+    }
+
+    #[test]
+    fn validate_rejects_vad_threshold_out_of_range() {
+        let mut s = Settings::default();
+        s.vad_threshold_start = 1.5;
+        assert!(s.validate().is_err());
+
+        let mut s = Settings::default();
+        s.vad_threshold_end = -0.1;
+        assert!(s.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_start_below_end_threshold() {
+        let mut s = Settings::default();
+        s.vad_threshold_start = 0.2;
+        s.vad_threshold_end = 0.5;
+        assert!(s.validate().is_err());
+        assert!(s.validate().unwrap_err().contains("vad_threshold_start"));
+    }
+
+    #[test]
+    fn validate_accepts_equal_thresholds() {
+        let mut s = Settings::default();
+        s.vad_threshold_start = 0.5;
+        s.vad_threshold_end = 0.5;
+        assert!(s.validate().is_ok());
+    }
+
+    #[test]
+    fn chunk_ms_to_samples_correct_values() {
+        assert_eq!(chunk_ms_to_samples(80), 1280);
+        assert_eq!(chunk_ms_to_samples(160), 2560);
+        assert_eq!(chunk_ms_to_samples(560), 8960);
+        assert_eq!(chunk_ms_to_samples(1120), 17920);
+    }
+
+    #[test]
+    fn expand_tilde_with_home() {
+        let result = expand_tilde("~/some/path");
+        // Should expand to $HOME/some/path (or unchanged if HOME is unset)
+        assert!(!result.to_string_lossy().starts_with("~/"));
+    }
+
+    #[test]
+    fn expand_tilde_absolute_path_unchanged() {
+        let result = expand_tilde("/absolute/path");
+        assert_eq!(result, PathBuf::from("/absolute/path"));
+    }
+
+    #[test]
+    fn expand_tilde_relative_path_unchanged() {
+        let result = expand_tilde("relative/path");
+        assert_eq!(result, PathBuf::from("relative/path"));
+    }
+
+    #[test]
+    fn serde_roundtrip() {
+        let settings = Settings::default();
+        let json = serde_json::to_string(&settings).unwrap();
+        let deserialized: Settings = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.chunk_ms, settings.chunk_ms);
+        assert_eq!(deserialized.model_path, settings.model_path);
+        assert_eq!(deserialized.theme_mode, settings.theme_mode);
+    }
+
+    #[test]
+    fn serde_missing_fields_use_defaults() {
+        // Simulate a settings file that only has some fields
+        let json = r#"{"chunk_ms": 160}"#;
+        let settings: Settings = serde_json::from_str(json).unwrap();
+        assert_eq!(settings.chunk_ms, 160);
+        // All other fields should be defaults
+        assert_eq!(settings.intra_threads, 2);
+        assert_eq!(settings.punctuation_reset, true);
+    }
+}
