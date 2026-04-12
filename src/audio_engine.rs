@@ -119,8 +119,7 @@ impl<E: EngineEventSink> AudioEngine<E> {
                     self.stop_active_session();
                     if let Err(e) = self.start_session(device_id, settings) {
                         eprintln!("Failed to start transcription: {}", e);
-                        self.event_sink
-                            .on_error(format!("Error: {}", e));
+                        self.event_sink.on_error(format!("Error: {}", e));
                     }
                 }
                 Command::Stop => {
@@ -344,8 +343,7 @@ impl<E: EngineEventSink> AudioEngine<E> {
             }
             Err(e) => {
                 eprintln!("[Engine] Reconnect failed: {}", e);
-                self.event_sink
-                    .on_error(format!("Reconnect failed: {}", e));
+                self.event_sink.on_error(format!("Reconnect failed: {}", e));
             }
         }
     }
@@ -549,23 +547,25 @@ impl<E: EngineEventSink> AudioEngine<E> {
             let drain_audio_ms = drain_count as f64 / input_rate as f64 * 1000.0;
 
             let resample_start = Instant::now();
-            let (samples_16k, _resample_in, _resample_out, _resample_leftover) =
-                if let Some(ref mut resampler) = resampler {
-                    let rs_chunk = resampler.input_frames_next();
-                    let mut resampled = Vec::new();
-                    let mut offset = 0;
+            let (samples_16k, _resample_in, _resample_out, _resample_leftover) = if let Some(
+                ref mut resampler,
+            ) = resampler
+            {
+                let rs_chunk = resampler.input_frames_next();
+                let mut resampled = Vec::new();
+                let mut offset = 0;
 
-                    while offset + rs_chunk <= drained.len() {
-                        let input_chunk = &drained[offset..offset + rs_chunk];
-                        match resampler.process(&[input_chunk], None) {
-                            Ok(output) => {
-                                if !output.is_empty() {
-                                    resampled.extend_from_slice(&output[0]);
-                                }
+                while offset + rs_chunk <= drained.len() {
+                    let input_chunk = &drained[offset..offset + rs_chunk];
+                    match resampler.process(&[input_chunk], None) {
+                        Ok(output) => {
+                            if !output.is_empty() {
+                                resampled.extend_from_slice(&output[0]);
                             }
-                            Err(e) => {
-                                if let Some(ref db) = db {
-                                    let _ = db.execute(
+                        }
+                        Err(e) => {
+                            if let Some(ref db) = db {
+                                let _ = db.execute(
                                     "INSERT INTO events (session_id, uptime_ms, event_type, error_msg)
                                          VALUES (?1, ?2, 'resample_error', ?3)",
                                     rusqlite::params![
@@ -574,27 +574,27 @@ impl<E: EngineEventSink> AudioEngine<E> {
                                         e.to_string()
                                     ],
                                 );
-                                }
                             }
                         }
-                        offset += rs_chunk;
                     }
+                    offset += rs_chunk;
+                }
 
-                    let leftover = drained.len() - offset;
-                    if leftover > 0 {
-                        let mut guard = buffer.lock().unwrap();
-                        for &s in &drained[offset..] {
-                            guard.push_front(s);
-                        }
+                let leftover = drained.len() - offset;
+                if leftover > 0 {
+                    let mut guard = buffer.lock().unwrap();
+                    for &s in &drained[offset..] {
+                        guard.push_front(s);
                     }
+                }
 
-                    let rs_in = drain_count - leftover;
-                    let rs_out = resampled.len();
-                    (resampled, rs_in, rs_out, leftover)
-                } else {
-                    let len = drained.len();
-                    (drained, len, len, 0usize)
-                };
+                let rs_in = drain_count - leftover;
+                let rs_out = resampled.len();
+                (resampled, rs_in, rs_out, leftover)
+            } else {
+                let len = drained.len();
+                (drained, len, len, 0usize)
+            };
 
             let resample_ms = resample_start.elapsed().as_millis() as i64;
 
