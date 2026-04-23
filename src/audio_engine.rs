@@ -56,9 +56,9 @@ pub struct AudioEngine<E: EngineEventSink> {
     cached_vad: Option<VadProcessor>,
     cached_model_path: Option<String>,
     cached_model_config: Option<(usize, usize)>,
-    /// Optional path for the diagnostics SQLite database.
-    /// If None, diagnostics logging is disabled.
-    diag_db_path: Option<PathBuf>,
+    /// Runtime toggle for diagnostics logging. Shared with the active
+    /// processing thread so flipping it off takes effect mid-session.
+    diag_enabled: Arc<AtomicBool>,
 }
 
 impl<E: EngineEventSink> AudioEngine<E> {
@@ -67,7 +67,7 @@ impl<E: EngineEventSink> AudioEngine<E> {
         cmd_rx: mpsc::Receiver<Command>,
         capture_backend: Box<dyn AudioCapture>,
         active_session_info: Arc<Mutex<ActiveSessionInfo>>,
-        diag_db_path: Option<PathBuf>,
+        diag_enabled: Arc<AtomicBool>,
     ) -> Self {
         println!(
             "AudioEngine initialized with {} backend",
@@ -87,7 +87,7 @@ impl<E: EngineEventSink> AudioEngine<E> {
             cached_vad: None,
             cached_model_path: None,
             cached_model_config: None,
-            diag_db_path,
+            diag_enabled,
         }
     }
 
@@ -129,6 +129,8 @@ impl<E: EngineEventSink> AudioEngine<E> {
                     self.reconnect_stream(device_id);
                 }
                 Command::UpdateSettings { settings } => {
+                    self.diag_enabled
+                        .store(settings.diagnostics_enabled, Ordering::Relaxed);
                     if let Some(ref tx) = self.settings_tx {
                         let _ = tx.send(settings);
                     }
@@ -218,7 +220,16 @@ impl<E: EngineEventSink> AudioEngine<E> {
         let (settings_tx, settings_rx) = mpsc::channel();
         self.settings_tx = Some(settings_tx);
 
-        let diag_db_path = self.diag_db_path.clone();
+        // Snapshot live diagnostics toggle to match the new session's settings,
+        // then compute the DB path only if enabled at session start.
+        self.diag_enabled
+            .store(settings.diagnostics_enabled, Ordering::Relaxed);
+        let diag_db_path = if settings.diagnostics_enabled {
+            Some(settings::expand_tilde(&settings.diagnostics_db_path))
+        } else {
+            None
+        };
+        let diag_enabled_for_thread = Arc::clone(&self.diag_enabled);
         let buffer_for_thread = Arc::clone(&buffer);
         let processing_thread = thread::spawn(move || {
             println!("[diag] Processing thread started");
@@ -233,6 +244,7 @@ impl<E: EngineEventSink> AudioEngine<E> {
                 cached_vad,
                 settings_rx,
                 diag_db_path,
+                diag_enabled_for_thread,
             ) {
                 Ok(models) => {
                     println!("[diag] Processing loop exited normally");
@@ -417,19 +429,25 @@ impl<E: EngineEventSink> AudioEngine<E> {
         cached_vad: Option<VadProcessor>,
         settings_rx: mpsc::Receiver<Settings>,
         diag_db_path: Option<PathBuf>,
+        diag_enabled: Arc<AtomicBool>,
     ) -> Result<(Nemotron, VadProcessor), Box<dyn std::error::Error>> {
         let chunk_size = settings::chunk_ms_to_samples(settings.chunk_ms);
         let db = Self::init_diag_db(diag_db_path.as_deref())?;
 
-        let session_id = if let Some(ref db) = db {
-            db.execute(
+        // Every `db.as_ref().filter(|_| diag_enabled.load(...))` site below
+        // gates a write on the live toggle. If the user flips diagnostics off
+        // mid-session, writes are skipped while the connection stays open, so
+        // re-enabling resumes writes to the same session row.
+        let session_id =
+            if let Some(db) = db.as_ref().filter(|_| diag_enabled.load(Ordering::Relaxed)) {
+                db.execute(
                 "INSERT INTO sessions (input_rate, chunk_size, needs_resample) VALUES (?1, ?2, ?3)",
                 rusqlite::params![input_rate as i64, chunk_size as i64, needs_resample as i64],
             )?;
-            db.last_insert_rowid()
-        } else {
-            0
-        };
+                db.last_insert_rowid()
+            } else {
+                0
+            };
 
         let mut punctuation_reset_enabled = settings.punctuation_reset;
         let mut empty_reset_threshold = settings.empty_reset_threshold;
@@ -501,7 +519,7 @@ impl<E: EngineEventSink> AudioEngine<E> {
 
         loop {
             if stop_flag.load(Ordering::Relaxed) {
-                if let Some(ref db) = db {
+                if let Some(db) = db.as_ref().filter(|_| diag_enabled.load(Ordering::Relaxed)) {
                     let _ = db.execute(
                         "INSERT INTO events (session_id, uptime_ms, event_type, chunk_num)
                          VALUES (?1, ?2, 'shutdown', ?3)",
@@ -564,7 +582,9 @@ impl<E: EngineEventSink> AudioEngine<E> {
                             }
                         }
                         Err(e) => {
-                            if let Some(ref db) = db {
+                            if let Some(db) =
+                                db.as_ref().filter(|_| diag_enabled.load(Ordering::Relaxed))
+                            {
                                 let _ = db.execute(
                                     "INSERT INTO events (session_id, uptime_ms, event_type, error_msg)
                                          VALUES (?1, ?2, 'resample_error', ?3)",
@@ -612,7 +632,9 @@ impl<E: EngineEventSink> AudioEngine<E> {
                 let (decision, _prob) = match vad.process_frame(frame) {
                     Ok(result) => result,
                     Err(e) => {
-                        if let Some(ref db) = db {
+                        if let Some(db) =
+                            db.as_ref().filter(|_| diag_enabled.load(Ordering::Relaxed))
+                        {
                             let _ = db.execute(
                                 "INSERT INTO events (session_id, uptime_ms, event_type, error_msg)
                                  VALUES (?1, ?2, 'vad_error', ?3)",
@@ -636,7 +658,9 @@ impl<E: EngineEventSink> AudioEngine<E> {
                         speech_start_uptime_ms = Some(uptime);
                         consecutive_empty = 0;
 
-                        if let Some(ref db) = db {
+                        if let Some(db) =
+                            db.as_ref().filter(|_| diag_enabled.load(Ordering::Relaxed))
+                        {
                             let _ = db.execute(
                                 "INSERT INTO vad_events (session_id, uptime_ms, event_type, pre_speech_samples)
                                  VALUES (?1, ?2, 'speech_start', ?3)",
@@ -659,7 +683,9 @@ impl<E: EngineEventSink> AudioEngine<E> {
                             .map(|start| (uptime - start) as f64)
                             .unwrap_or(0.0);
 
-                        if let Some(ref db) = db {
+                        if let Some(db) =
+                            db.as_ref().filter(|_| diag_enabled.load(Ordering::Relaxed))
+                        {
                             let _ = db.execute(
                                 "INSERT INTO vad_events (session_id, uptime_ms, event_type, speech_duration_ms, consecutive_empty)
                                  VALUES (?1, ?2, 'speech_end', ?3, ?4)",
@@ -713,7 +739,9 @@ impl<E: EngineEventSink> AudioEngine<E> {
                         }
 
                         let iteration_ms = iter_start.elapsed().as_millis() as i64;
-                        if let Some(ref db) = db {
+                        if let Some(db) =
+                            db.as_ref().filter(|_| diag_enabled.load(Ordering::Relaxed))
+                        {
                             let _ = db.execute(
                                 "INSERT INTO events (session_id, uptime_ms, event_type, chunk_num,
                                  inference_ms, drain_samples, drain_audio_ms,
@@ -747,7 +775,9 @@ impl<E: EngineEventSink> AudioEngine<E> {
                             && !is_empty
                             && ends_with_sentence_punctuation(&preview)
                         {
-                            if let Some(ref db) = db {
+                            if let Some(db) =
+                                db.as_ref().filter(|_| diag_enabled.load(Ordering::Relaxed))
+                            {
                                 let uptime = loop_start.elapsed().as_millis() as i64;
                                 let _ = db.execute(
                                     "INSERT INTO vad_events (session_id, uptime_ms, event_type, consecutive_empty)
@@ -763,7 +793,9 @@ impl<E: EngineEventSink> AudioEngine<E> {
                         if consecutive_empty >= empty_reset_threshold
                             && vad.state() == VadState::Speech
                         {
-                            if let Some(ref db) = db {
+                            if let Some(db) =
+                                db.as_ref().filter(|_| diag_enabled.load(Ordering::Relaxed))
+                            {
                                 let uptime = loop_start.elapsed().as_millis() as i64;
                                 let _ = db.execute(
                                     "INSERT INTO vad_events (session_id, uptime_ms, event_type, consecutive_empty)
@@ -776,7 +808,9 @@ impl<E: EngineEventSink> AudioEngine<E> {
                         }
                     }
                     Err(e) => {
-                        if let Some(ref db) = db {
+                        if let Some(db) =
+                            db.as_ref().filter(|_| diag_enabled.load(Ordering::Relaxed))
+                        {
                             let _ = db.execute(
                                 "INSERT INTO events (session_id, uptime_ms, event_type, chunk_num,
                                  inference_ms, error_msg, vad_state)

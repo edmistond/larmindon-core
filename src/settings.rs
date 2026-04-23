@@ -23,6 +23,10 @@ pub struct Settings {
     pub vad_threshold_start: f32,
     /// VAD speech-end threshold (probability to close a speech segment)
     pub vad_threshold_end: f32,
+    /// Whether to write per-chunk diagnostics to the SQLite DB.
+    pub diagnostics_enabled: bool,
+    /// Path to the diagnostics SQLite file. Tilde is expanded at use.
+    pub diagnostics_db_path: String,
 }
 
 impl Default for Settings {
@@ -39,6 +43,8 @@ impl Default for Settings {
             theme_mode: "dark".to_string(),
             vad_threshold_start: 0.5,
             vad_threshold_end: 0.3,
+            diagnostics_enabled: false,
+            diagnostics_db_path: Self::default_diag_db_path().to_string_lossy().into_owned(),
         }
     }
 }
@@ -56,6 +62,11 @@ impl Settings {
 
     fn settings_path() -> PathBuf {
         Self::config_dir().join("settings.json")
+    }
+
+    /// Default location for the diagnostics SQLite DB: alongside settings.json.
+    pub fn default_diag_db_path() -> PathBuf {
+        Self::config_dir().join("larmindon_diag.sqlite")
     }
 
     /// Load settings from disk, falling back to defaults on any error.
@@ -203,6 +214,26 @@ impl Settings {
                 "vad_threshold_start ({}) must be >= vad_threshold_end ({})",
                 self.vad_threshold_start, self.vad_threshold_end
             ));
+        }
+
+        if self.diagnostics_enabled {
+            if self.diagnostics_db_path.trim().is_empty() {
+                return Err(
+                    "diagnostics_db_path cannot be empty when diagnostics_enabled".to_string(),
+                );
+            }
+            let expanded = expand_tilde(&self.diagnostics_db_path);
+            if let Some(parent) = expanded.parent() {
+                if !parent.as_os_str().is_empty() && !parent.exists() {
+                    if let Err(e) = std::fs::create_dir_all(parent) {
+                        return Err(format!(
+                            "Cannot create parent directory {} for diagnostics DB: {}",
+                            parent.display(),
+                            e
+                        ));
+                    }
+                }
+            }
         }
 
         // Warn (but don't error) if model path doesn't exist
