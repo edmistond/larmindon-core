@@ -27,6 +27,16 @@ pub struct Settings {
     pub diagnostics_enabled: bool,
     /// Path to the diagnostics SQLite file. Tilde is expanded at use.
     pub diagnostics_db_path: String,
+    /// Whether AGC (Automatic Gain Control) is active.
+    pub agc_enabled: bool,
+    /// AGC target RMS level in dBFS (e.g. -20.0).
+    pub agc_target_rms_dbfs: f32,
+    /// AGC maximum gain in dB (ceiling to prevent noise-floor amplification).
+    pub agc_max_gain_db: f32,
+    /// AGC attack time in ms (fast gain reduction when signal gets loud).
+    pub agc_attack_ms: f32,
+    /// AGC release time in ms (slow gain increase when signal gets quiet).
+    pub agc_release_ms: f32,
 }
 
 impl Default for Settings {
@@ -45,6 +55,11 @@ impl Default for Settings {
             vad_threshold_end: 0.3,
             diagnostics_enabled: false,
             diagnostics_db_path: Self::default_diag_db_path().to_string_lossy().into_owned(),
+            agc_enabled: false,
+            agc_target_rms_dbfs: -20.0,
+            agc_max_gain_db: 30.0,
+            agc_attack_ms: 20.0,
+            agc_release_ms: 400.0,
         }
     }
 }
@@ -234,6 +249,31 @@ impl Settings {
                     }
                 }
             }
+        }
+
+        if !(-60.0..=0.0).contains(&self.agc_target_rms_dbfs) {
+            return Err(format!(
+                "agc_target_rms_dbfs must be between -60.0 and 0.0, got {}",
+                self.agc_target_rms_dbfs
+            ));
+        }
+        if !(0.0..=60.0).contains(&self.agc_max_gain_db) {
+            return Err(format!(
+                "agc_max_gain_db must be between 0.0 and 60.0, got {}",
+                self.agc_max_gain_db
+            ));
+        }
+        if !(1.0..=1000.0).contains(&self.agc_attack_ms) {
+            return Err(format!(
+                "agc_attack_ms must be between 1.0 and 1000.0, got {}",
+                self.agc_attack_ms
+            ));
+        }
+        if !(1.0..=5000.0).contains(&self.agc_release_ms) {
+            return Err(format!(
+                "agc_release_ms must be between 1.0 and 5000.0, got {}",
+                self.agc_release_ms
+            ));
         }
 
         // Warn (but don't error) if model path doesn't exist

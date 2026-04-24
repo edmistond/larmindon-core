@@ -11,6 +11,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Instant;
 
+use crate::agc::AgcProcessor;
 use crate::audio_capture::{self, ActiveSessionInfo, AudioCapture, AudioDevice, AudioStream};
 use crate::settings::{self, Settings};
 use crate::vad::{VadDecision, VadProcessor, VadState};
@@ -498,6 +499,15 @@ impl<E: EngineEventSink> AudioEngine<E> {
             v
         };
 
+        let mut agc = AgcProcessor::new(
+            settings.agc_enabled,
+            settings.agc_target_rms_dbfs,
+            settings.agc_max_gain_db,
+            settings.agc_attack_ms,
+            settings.agc_release_ms,
+            ASR_SAMPLE_RATE as f32,
+        );
+
         let mut resampler: Option<FftFixedIn<f32>> = if needs_resample {
             Some(FftFixedIn::<f32>::new(
                 input_rate,
@@ -548,6 +558,13 @@ impl<E: EngineEventSink> AudioEngine<E> {
                     500,
                     250,
                 );
+                agc.update_params(
+                    new_settings.agc_enabled,
+                    new_settings.agc_target_rms_dbfs,
+                    new_settings.agc_max_gain_db,
+                    new_settings.agc_attack_ms,
+                    new_settings.agc_release_ms,
+                );
             }
 
             let drained: Vec<f32> = {
@@ -565,9 +582,10 @@ impl<E: EngineEventSink> AudioEngine<E> {
             let drain_audio_ms = drain_count as f64 / input_rate as f64 * 1000.0;
 
             let resample_start = Instant::now();
-            let (samples_16k, _resample_in, _resample_out, _resample_leftover) = if let Some(
+            let (mut samples_16k, _resample_in, _resample_out, _resample_leftover) = if let Some(
                 ref mut resampler,
-            ) = resampler
+            ) =
+                resampler
             {
                 let rs_chunk = resampler.input_frames_next();
                 let mut resampled = Vec::new();
@@ -617,6 +635,9 @@ impl<E: EngineEventSink> AudioEngine<E> {
             };
 
             let resample_ms = resample_start.elapsed().as_millis() as i64;
+
+            // --- AGC ---
+            agc.process(&mut samples_16k);
 
             // --- VAD gating ---
             // Prepend any leftover from last iteration
