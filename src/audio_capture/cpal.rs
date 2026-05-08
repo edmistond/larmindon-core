@@ -97,6 +97,7 @@ impl AudioCapture for CpalBackend {
 
         let config = device
             .default_input_config()
+            .or_else(|_| device.default_output_config())
             .map_err(|e| format!("Failed to get default config: {}", e))?;
         let sample_format = config.sample_format();
         let stream_config: StreamConfig = config.into();
