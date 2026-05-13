@@ -421,7 +421,9 @@ impl<E: EngineEventSink> AudioEngine<E> {
                  pre_speech_samples INTEGER,
                  speech_duration_ms REAL,
                  consecutive_empty INTEGER,
-                 probability REAL
+                 probability REAL,
+                 chunks_since_decoder_reset INTEGER,
+                 audio_ms_since_decoder_reset INTEGER
              );",
         )?;
         // Migrate: add columns if they don't exist (ALTER TABLE has no IF NOT EXISTS).
@@ -429,6 +431,11 @@ impl<E: EngineEventSink> AudioEngine<E> {
         let _ = conn.execute_batch("ALTER TABLE events ADD COLUMN vad_ms INTEGER;");
         let _ = conn.execute_batch("ALTER TABLE events ADD COLUMN resample_ms INTEGER;");
         let _ = conn.execute_batch("ALTER TABLE events ADD COLUMN iteration_ms INTEGER;");
+        let _ = conn
+            .execute_batch("ALTER TABLE vad_events ADD COLUMN chunks_since_decoder_reset INTEGER;");
+        let _ = conn.execute_batch(
+            "ALTER TABLE vad_events ADD COLUMN audio_ms_since_decoder_reset INTEGER;",
+        );
         Ok(Some(conn))
     }
 
@@ -540,6 +547,7 @@ impl<E: EngineEventSink> AudioEngine<E> {
         let loop_start = Instant::now();
         let mut chunk_num: u64 = 0;
         let mut consecutive_empty: u32 = 0;
+        let mut chunks_since_decoder_reset: u64 = 0;
         let mut speech_start_uptime_ms: Option<i64> = None;
 
         loop {
@@ -724,10 +732,25 @@ impl<E: EngineEventSink> AudioEngine<E> {
                         if let Some(db) =
                             db.as_ref().filter(|_| diag_enabled.load(Ordering::Relaxed))
                         {
+                            let chunks_at_reset = chunks_since_decoder_reset as i64;
                             let _ = db.execute(
-                                "INSERT INTO vad_events (session_id, uptime_ms, event_type, speech_duration_ms, consecutive_empty)
-                                 VALUES (?1, ?2, 'speech_end', ?3, ?4)",
-                                rusqlite::params![session_id, uptime, duration_ms, consecutive_empty as i64],
+                                "INSERT INTO vad_events (
+                                    session_id, uptime_ms, event_type, speech_duration_ms,
+                                    consecutive_empty, chunks_since_decoder_reset,
+                                    audio_ms_since_decoder_reset
+                                 )
+                                 VALUES (?1, ?2, 'speech_end', ?3, ?4, ?5, ?6)",
+                                rusqlite::params![
+                                    session_id,
+                                    uptime,
+                                    duration_ms,
+                                    consecutive_empty as i64,
+                                    chunks_at_reset,
+                                    chunks_to_audio_ms(
+                                        chunks_since_decoder_reset,
+                                        settings.chunk_ms
+                                    ),
+                                ],
                             );
                         }
 
@@ -739,6 +762,7 @@ impl<E: EngineEventSink> AudioEngine<E> {
                         speech_start_uptime_ms = None;
                         consecutive_empty = 0;
                         model.reset();
+                        chunks_since_decoder_reset = 0;
                     }
                 }
             }
@@ -760,17 +784,14 @@ impl<E: EngineEventSink> AudioEngine<E> {
             while asr_buffer.len().saturating_sub(asr_consumed) >= chunk_size {
                 let chunk = &asr_buffer[asr_consumed..asr_consumed + chunk_size];
                 asr_consumed += chunk_size;
+                chunks_since_decoder_reset += 1;
                 let infer_start = Instant::now();
                 match model.transcribe_chunk(chunk) {
                     Ok(text) => {
                         let infer_ms = infer_start.elapsed().as_millis() as i64;
                         chunk_num += 1;
                         let is_empty = text.is_empty();
-                        let preview = if text.len() > 200 {
-                            text[..200].to_string()
-                        } else {
-                            text.clone()
-                        };
+                        let preview = text_preview(&text, 200);
 
                         if is_empty {
                             consecutive_empty += 1;
@@ -806,27 +827,41 @@ impl<E: EngineEventSink> AudioEngine<E> {
                             );
                         }
 
-                        if !is_empty {
-                            event_sink.on_transcription(text);
-                        }
-
                         // Punctuation-based decoder reset
                         if punctuation_reset_enabled
                             && !is_empty
-                            && ends_with_sentence_punctuation(&preview)
+                            && ends_with_sentence_punctuation(&text)
                         {
                             if let Some(db) =
                                 db.as_ref().filter(|_| diag_enabled.load(Ordering::Relaxed))
                             {
                                 let uptime = loop_start.elapsed().as_millis() as i64;
+                                let chunks_at_reset = chunks_since_decoder_reset as i64;
                                 let _ = db.execute(
-                                    "INSERT INTO vad_events (session_id, uptime_ms, event_type, consecutive_empty)
-                                     VALUES (?1, ?2, 'punctuation_reset', ?3)",
-                                    rusqlite::params![session_id, uptime, consecutive_empty as i64],
+                                    "INSERT INTO vad_events (
+                                        session_id, uptime_ms, event_type, consecutive_empty,
+                                        chunks_since_decoder_reset, audio_ms_since_decoder_reset
+                                     )
+                                     VALUES (?1, ?2, 'punctuation_reset', ?3, ?4, ?5)",
+                                    rusqlite::params![
+                                        session_id,
+                                        uptime,
+                                        consecutive_empty as i64,
+                                        chunks_at_reset,
+                                        chunks_to_audio_ms(
+                                            chunks_since_decoder_reset,
+                                            settings.chunk_ms
+                                        ),
+                                    ],
                                 );
                             }
                             model.reset();
+                            chunks_since_decoder_reset = 0;
                             consecutive_empty = 0;
+                        }
+
+                        if !is_empty {
+                            event_sink.on_transcription(text);
                         }
 
                         // Mid-speech reset heuristic
@@ -837,13 +872,27 @@ impl<E: EngineEventSink> AudioEngine<E> {
                                 db.as_ref().filter(|_| diag_enabled.load(Ordering::Relaxed))
                             {
                                 let uptime = loop_start.elapsed().as_millis() as i64;
+                                let chunks_at_reset = chunks_since_decoder_reset as i64;
                                 let _ = db.execute(
-                                    "INSERT INTO vad_events (session_id, uptime_ms, event_type, consecutive_empty)
-                                     VALUES (?1, ?2, 'mid_speech_reset', ?3)",
-                                    rusqlite::params![session_id, uptime, consecutive_empty as i64],
+                                    "INSERT INTO vad_events (
+                                        session_id, uptime_ms, event_type, consecutive_empty,
+                                        chunks_since_decoder_reset, audio_ms_since_decoder_reset
+                                     )
+                                     VALUES (?1, ?2, 'mid_speech_reset', ?3, ?4, ?5)",
+                                    rusqlite::params![
+                                        session_id,
+                                        uptime,
+                                        consecutive_empty as i64,
+                                        chunks_at_reset,
+                                        chunks_to_audio_ms(
+                                            chunks_since_decoder_reset,
+                                            settings.chunk_ms
+                                        ),
+                                    ],
                                 );
                             }
                             model.reset();
+                            chunks_since_decoder_reset = 0;
                             consecutive_empty = 0;
                         }
                     }
@@ -884,6 +933,24 @@ fn take_complete_frames(leftover: &mut Vec<f32>, drained: &[f32], frame_size: us
         input.truncate(complete_len);
     }
     input
+}
+
+fn chunks_to_audio_ms(chunks: u64, chunk_ms: usize) -> i64 {
+    chunks.saturating_mul(chunk_ms as u64).min(i64::MAX as u64) as i64
+}
+
+fn text_preview(text: &str, max_bytes: usize) -> String {
+    if text.len() <= max_bytes {
+        return text.to_string();
+    }
+
+    let end = text
+        .char_indices()
+        .map(|(idx, _)| idx)
+        .take_while(|&idx| idx <= max_bytes)
+        .last()
+        .unwrap_or(0);
+    text[..end].to_string()
 }
 
 /// Check if text ends with sentence-ending punctuation (`.`, `?`, `!`),
@@ -986,5 +1053,25 @@ mod tests {
 
         assert!(complete.is_empty());
         assert_eq!(leftover, vec![1.0, 2.0]);
+    }
+
+    #[test]
+    fn text_preview_does_not_split_utf8() {
+        assert_eq!(text_preview("abcédef", 4), "abc");
+        assert_eq!(text_preview("abcédef", 5), "abcé");
+    }
+
+    #[test]
+    fn full_text_punctuation_can_differ_from_preview() {
+        let long_text = format!("{}.", "word ".repeat(60));
+        let preview = text_preview(&long_text, 200);
+
+        assert!(!ends_with_sentence_punctuation(&preview));
+        assert!(ends_with_sentence_punctuation(&long_text));
+    }
+
+    #[test]
+    fn chunks_to_audio_ms_uses_chunk_duration() {
+        assert_eq!(chunks_to_audio_ms(6, 560), 3360);
     }
 }
