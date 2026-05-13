@@ -1,7 +1,9 @@
-use crate::audio_capture::{AudioCapture, AudioDevice, AudioStream, DeviceType};
+use crate::audio_capture::{
+    AudioCapture, AudioDevice, AudioStream, AudioStreamMetadata, CaptureBuffer, DeviceType,
+    StartedAudioStream,
+};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{Device, SampleFormat, Stream, StreamConfig};
-use std::collections::VecDeque;
 use std::error::Error;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -68,9 +70,9 @@ impl AudioCapture for CpalBackend {
     fn start(
         &self,
         device_id: Option<String>,
-        buffer: Arc<Mutex<VecDeque<f32>>>,
+        buffer: Arc<Mutex<CaptureBuffer>>,
         stop_flag: Arc<AtomicBool>,
-    ) -> Result<Box<dyn AudioStream>, Box<dyn Error>> {
+    ) -> Result<StartedAudioStream, Box<dyn Error>> {
         let host = cpal::default_host();
 
         let device = if let Some(ref id) = device_id {
@@ -108,10 +110,18 @@ impl AudioCapture for CpalBackend {
             channels, stream_config.sample_rate, sample_format
         );
 
+        let metadata = AudioStreamMetadata {
+            sample_rate: stream_config.sample_rate as usize,
+            channels,
+            sample_format: format!("{:?}", sample_format),
+        };
         let stream = build_stream(&device, &stream_config, sample_format, channels, buffer)?;
         stream.play()?;
 
-        Ok(Box::new(CpalStream { stream, stop_flag }))
+        Ok(StartedAudioStream {
+            stream: Box::new(CpalStream { stream, stop_flag }),
+            metadata,
+        })
     }
 
     fn name(&self) -> &'static str {
@@ -137,7 +147,7 @@ fn build_stream(
     config: &StreamConfig,
     sample_format: SampleFormat,
     channels: usize,
-    buffer: Arc<Mutex<VecDeque<f32>>>,
+    buffer: Arc<Mutex<CaptureBuffer>>,
 ) -> Result<Stream, Box<dyn Error>> {
     let err_fn = |err| eprintln!("CPAL stream error: {}", err);
 
@@ -147,7 +157,7 @@ fn build_stream(
             device.build_input_stream(
                 config,
                 move |data: &[f32], _: &cpal::InputCallbackInfo| {
-                    push_mono(data, channels, &buf);
+                    push_mono_f32(data, channels, &buf);
                 },
                 err_fn,
                 None,
@@ -158,8 +168,7 @@ fn build_stream(
             device.build_input_stream(
                 config,
                 move |data: &[i16], _: &cpal::InputCallbackInfo| {
-                    let floats: Vec<f32> = data.iter().map(|&s| s as f32 / 32768.0).collect();
-                    push_mono(&floats, channels, &buf);
+                    push_mono_convert(data, channels, &buf, |s| s as f32 / 32768.0);
                 },
                 err_fn,
                 None,
@@ -170,9 +179,7 @@ fn build_stream(
             device.build_input_stream(
                 config,
                 move |data: &[u8], _: &cpal::InputCallbackInfo| {
-                    let floats: Vec<f32> =
-                        data.iter().map(|&s| (s as f32 - 128.0) / 128.0).collect();
-                    push_mono(&floats, channels, &buf);
+                    push_mono_convert(data, channels, &buf, |s| (s as f32 - 128.0) / 128.0);
                 },
                 err_fn,
                 None,
@@ -183,8 +190,7 @@ fn build_stream(
             device.build_input_stream(
                 config,
                 move |data: &[i32], _: &cpal::InputCallbackInfo| {
-                    let floats: Vec<f32> = data.iter().map(|&s| s as f32 / 2147483648.0).collect();
-                    push_mono(&floats, channels, &buf);
+                    push_mono_convert(data, channels, &buf, |s| s as f32 / 2147483648.0);
                 },
                 err_fn,
                 None,
@@ -197,16 +203,35 @@ fn build_stream(
 }
 
 /// Downmix interleaved multi-channel audio to mono and push into the shared buffer.
-fn push_mono(data: &[f32], channels: usize, buffer: &Arc<Mutex<VecDeque<f32>>>) {
-    let mono: Vec<f32> = if channels == 1 {
-        data.to_vec()
-    } else {
-        data.chunks_exact(channels)
-            .map(|frame| frame.iter().sum::<f32>() / channels as f32)
-            .collect()
-    };
-
+fn push_mono_f32(data: &[f32], channels: usize, buffer: &Arc<Mutex<CaptureBuffer>>) {
     if let Ok(mut guard) = buffer.lock() {
-        guard.extend(mono.iter());
+        if channels == 1 {
+            guard.extend_samples(data.iter().copied());
+        } else {
+            for frame in data.chunks_exact(channels) {
+                guard.push_sample(frame.iter().sum::<f32>() / channels as f32);
+            }
+        }
+    }
+}
+
+fn push_mono_convert<T, F>(
+    data: &[T],
+    channels: usize,
+    buffer: &Arc<Mutex<CaptureBuffer>>,
+    convert: F,
+) where
+    T: Copy,
+    F: Fn(T) -> f32,
+{
+    if let Ok(mut guard) = buffer.lock() {
+        if channels == 1 {
+            guard.extend_samples(data.iter().copied().map(convert));
+        } else {
+            for frame in data.chunks_exact(channels) {
+                let mono = frame.iter().copied().map(&convert).sum::<f32>() / channels as f32;
+                guard.push_sample(mono);
+            }
+        }
     }
 }

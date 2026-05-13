@@ -1,7 +1,10 @@
-use crate::audio_capture::{ActiveSessionInfo, AudioCapture, AudioDevice, AudioStream, DeviceType};
+use crate::audio_capture::{
+    ActiveSessionInfo, AudioCapture, AudioDevice, AudioStream, AudioStreamMetadata, CaptureBuffer,
+    DeviceType, StartedAudioStream,
+};
 use crate::audio_engine::Command;
 use crate::EngineEventSink;
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::error::Error;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
@@ -45,9 +48,9 @@ impl AudioCapture for PipewireBackend {
     fn start(
         &self,
         device_id: Option<String>,
-        buffer: Arc<Mutex<VecDeque<f32>>>,
+        buffer: Arc<Mutex<CaptureBuffer>>,
         stop_flag: Arc<AtomicBool>,
-    ) -> Result<Box<dyn AudioStream>, Box<dyn Error>> {
+    ) -> Result<StartedAudioStream, Box<dyn Error>> {
         let device_id = device_id.ok_or("Device ID required for PipeWire")?;
 
         // Look up device type from cached enumeration
@@ -89,11 +92,18 @@ impl AudioCapture for PipewireBackend {
             }
         });
 
-        Ok(Box::new(PipewireStream {
-            stop_flag,
-            shutdown_tx,
-            thread: Some(stream_thread),
-        }))
+        Ok(StartedAudioStream {
+            stream: Box::new(PipewireStream {
+                stop_flag,
+                shutdown_tx,
+                thread: Some(stream_thread),
+            }),
+            metadata: AudioStreamMetadata {
+                sample_rate: 48000,
+                channels: 1,
+                sample_format: "F32LE".to_string(),
+            },
+        })
     }
 
     fn name(&self) -> &'static str {
@@ -135,7 +145,7 @@ impl AudioStream for PipewireStream {
 fn stream_thread_func(
     target_node_id: u32,
     device_type: DeviceType,
-    buffer: Arc<Mutex<VecDeque<f32>>>,
+    buffer: Arc<Mutex<CaptureBuffer>>,
     stop_flag: Arc<AtomicBool>,
     shutdown_rx: mpsc::Receiver<()>,
 ) -> Result<(), Box<dyn Error>> {
@@ -228,7 +238,7 @@ fn stream_thread_func(
                         };
 
                         if let Ok(mut guard) = buffer_clone.lock() {
-                            guard.extend(f32_samples.iter());
+                            guard.extend_samples(f32_samples.iter().copied());
                         }
                     } else if stride == bytes_per_sample * 2 {
                         // Stereo f32 - downmix to mono
@@ -246,7 +256,7 @@ fn stream_thread_func(
                             .collect();
 
                         if let Ok(mut guard) = buffer_clone.lock() {
-                            guard.extend(mono.iter());
+                            guard.extend_samples(mono);
                         }
                     } else {
                         println!("[PipeWire] Unsupported stride: {} (size={})", stride, size);

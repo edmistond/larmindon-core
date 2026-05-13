@@ -3,7 +3,6 @@ use parakeet_rs::ExecutionProvider;
 use parakeet_rs::{ExecutionConfig, Nemotron};
 use rubato::{FftFixedIn, Resampler};
 use rusqlite::Connection;
-use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
@@ -12,7 +11,9 @@ use std::thread::{self, JoinHandle};
 use std::time::Instant;
 
 use crate::agc::AgcProcessor;
-use crate::audio_capture::{self, ActiveSessionInfo, AudioCapture, AudioDevice, AudioStream};
+use crate::audio_capture::{
+    self, ActiveSessionInfo, AudioCapture, AudioDevice, AudioStream, CaptureBuffer,
+};
 use crate::settings::{self, Settings};
 use crate::vad::{VadDecision, VadProcessor, VadState};
 use crate::EngineEventSink;
@@ -49,7 +50,8 @@ pub struct AudioEngine<E: EngineEventSink> {
     active_stream: Option<Box<dyn AudioStream>>,
     processing_thread: Option<JoinHandle<Option<(Nemotron, VadProcessor)>>>,
     stop_flag: Option<Arc<AtomicBool>>,
-    active_buffer: Option<Arc<Mutex<VecDeque<f32>>>>,
+    capture_stop_flag: Option<Arc<AtomicBool>>,
+    active_buffer: Option<Arc<Mutex<CaptureBuffer>>>,
     active_session_info: Arc<Mutex<ActiveSessionInfo>>,
     settings_tx: Option<mpsc::Sender<Settings>>,
     // Cached models for reuse across sessions
@@ -81,6 +83,7 @@ impl<E: EngineEventSink> AudioEngine<E> {
             active_stream: None,
             processing_thread: None,
             stop_flag: None,
+            capture_stop_flag: None,
             active_buffer: None,
             active_session_info,
             settings_tx: None,
@@ -165,8 +168,10 @@ impl<E: EngineEventSink> AudioEngine<E> {
             return Err("No device available for capture".into());
         }
 
-        let buffer: Arc<Mutex<VecDeque<f32>>> = Arc::new(Mutex::new(VecDeque::new()));
+        let buffer: Arc<Mutex<CaptureBuffer>> =
+            Arc::new(Mutex::new(CaptureBuffer::for_sample_rate(48000)));
         let stop_flag = Arc::new(AtomicBool::new(false));
+        let capture_stop_flag = Arc::new(AtomicBool::new(false));
         let stop_flag_thread = Arc::clone(&stop_flag);
         let event_sink = self.event_sink.clone();
 
@@ -182,16 +187,18 @@ impl<E: EngineEventSink> AudioEngine<E> {
         let stream = self.capture_backend.start(
             device_id.clone(),
             Arc::clone(&buffer),
-            Arc::clone(&stop_flag),
+            Arc::clone(&capture_stop_flag),
         )?;
 
-        // Assume 48kHz input for now (will need to make this dynamic)
-        let input_rate = 48000;
+        let input_rate = stream.metadata.sample_rate;
+        if let Ok(mut guard) = buffer.lock() {
+            guard.set_capacity(input_rate * 10);
+        }
         let needs_resample = input_rate != ASR_SAMPLE_RATE;
 
         println!(
-            "Audio config: {} Hz (resample: {})",
-            input_rate, needs_resample
+            "Audio config: {} Hz, {} channel(s), {} (resample: {})",
+            input_rate, stream.metadata.channels, stream.metadata.sample_format, needs_resample
         );
 
         // Check if cached models are compatible with current settings
@@ -258,9 +265,10 @@ impl<E: EngineEventSink> AudioEngine<E> {
             }
         });
 
-        self.active_stream = Some(stream);
+        self.active_stream = Some(stream.stream);
         self.processing_thread = Some(processing_thread);
         self.stop_flag = Some(stop_flag);
+        self.capture_stop_flag = Some(capture_stop_flag);
         self.active_buffer = Some(buffer);
         self.cached_model_path = Some(model_path_str);
         self.cached_model_config = Some(model_config);
@@ -279,6 +287,9 @@ impl<E: EngineEventSink> AudioEngine<E> {
 
     fn stop_active_session(&mut self) {
         if let Some(flag) = self.stop_flag.take() {
+            flag.store(true, Ordering::Relaxed);
+        }
+        if let Some(flag) = self.capture_stop_flag.take() {
             flag.store(true, Ordering::Relaxed);
         }
         // Drop the settings sender so the processing thread's try_recv sees disconnect
@@ -312,9 +323,7 @@ impl<E: EngineEventSink> AudioEngine<E> {
     /// The processing loop keeps running and reading from the same shared buffer.
     fn reconnect_stream(&mut self, device_id: String) {
         // Only reconnect if we have an active session
-        let (Some(buffer), Some(stop_flag)) =
-            (self.active_buffer.as_ref(), self.stop_flag.as_ref())
-        else {
+        let Some(buffer) = self.active_buffer.as_ref() else {
             println!("[Engine] Reconnect ignored — no active session");
             return;
         };
@@ -325,15 +334,20 @@ impl<E: EngineEventSink> AudioEngine<E> {
         if let Some(stream) = self.active_stream.take() {
             stream.stop();
         }
+        if let Some(flag) = self.capture_stop_flag.take() {
+            flag.store(true, Ordering::Relaxed);
+        }
+        let capture_stop_flag = Arc::new(AtomicBool::new(false));
 
         // Start a new stream with the same buffer and stop_flag
         match self.capture_backend.start(
             Some(device_id.clone()),
             Arc::clone(buffer),
-            Arc::clone(stop_flag),
+            Arc::clone(&capture_stop_flag),
         ) {
             Ok(stream) => {
-                self.active_stream = Some(stream);
+                self.active_stream = Some(stream.stream);
+                self.capture_stop_flag = Some(capture_stop_flag);
 
                 // Update session info for the watcher
                 let device_info = self
@@ -421,7 +435,7 @@ impl<E: EngineEventSink> AudioEngine<E> {
     #[allow(clippy::too_many_arguments)]
     fn processing_loop(
         event_sink: E,
-        buffer: Arc<Mutex<VecDeque<f32>>>,
+        buffer: Arc<Mutex<CaptureBuffer>>,
         stop_flag: Arc<AtomicBool>,
         input_rate: usize,
         needs_resample: bool,
@@ -521,6 +535,7 @@ impl<E: EngineEventSink> AudioEngine<E> {
         };
 
         let mut asr_buffer: Vec<f32> = Vec::with_capacity(chunk_size * 2);
+        let mut resample_leftover: Vec<f32> = Vec::new();
         let mut vad_leftover: Vec<f32> = Vec::new();
         let loop_start = Instant::now();
         let mut chunk_num: u64 = 0;
@@ -567,10 +582,17 @@ impl<E: EngineEventSink> AudioEngine<E> {
                 );
             }
 
-            let drained: Vec<f32> = {
+            let (drained, dropped_samples) = {
                 let mut guard = buffer.lock().unwrap();
-                guard.drain(..).collect()
+                guard.drain_all()
             };
+
+            if dropped_samples > 0 {
+                eprintln!(
+                    "[diag] Capture buffer dropped {} stale sample(s)",
+                    dropped_samples
+                );
+            }
 
             if drained.is_empty() {
                 thread::sleep(std::time::Duration::from_millis(10));
@@ -588,11 +610,13 @@ impl<E: EngineEventSink> AudioEngine<E> {
                 resampler
             {
                 let rs_chunk = resampler.input_frames_next();
+                let resample_input =
+                    take_complete_frames(&mut resample_leftover, &drained, rs_chunk);
                 let mut resampled = Vec::new();
                 let mut offset = 0;
 
-                while offset + rs_chunk <= drained.len() {
-                    let input_chunk = &drained[offset..offset + rs_chunk];
+                while offset + rs_chunk <= resample_input.len() {
+                    let input_chunk = &resample_input[offset..offset + rs_chunk];
                     match resampler.process(&[input_chunk], None) {
                         Ok(output) => {
                             if !output.is_empty() {
@@ -618,15 +642,8 @@ impl<E: EngineEventSink> AudioEngine<E> {
                     offset += rs_chunk;
                 }
 
-                let leftover = drained.len() - offset;
-                if leftover > 0 {
-                    let mut guard = buffer.lock().unwrap();
-                    for &s in &drained[offset..] {
-                        guard.push_front(s);
-                    }
-                }
-
-                let rs_in = drain_count - leftover;
+                let leftover = resample_leftover.len();
+                let rs_in = resample_input.len();
                 let rs_out = resampled.len();
                 (resampled, rs_in, rs_out, leftover)
             } else {
@@ -739,10 +756,12 @@ impl<E: EngineEventSink> AudioEngine<E> {
                 VadState::Speech => "speech",
             };
 
-            while asr_buffer.len() >= chunk_size {
-                let chunk: Vec<f32> = asr_buffer.drain(..chunk_size).collect();
+            let mut asr_consumed = 0;
+            while asr_buffer.len().saturating_sub(asr_consumed) >= chunk_size {
+                let chunk = &asr_buffer[asr_consumed..asr_consumed + chunk_size];
+                asr_consumed += chunk_size;
                 let infer_start = Instant::now();
-                match model.transcribe_chunk(&chunk) {
+                match model.transcribe_chunk(chunk) {
                     Ok(text) => {
                         let infer_ms = infer_start.elapsed().as_millis() as i64;
                         chunk_num += 1;
@@ -776,7 +795,7 @@ impl<E: EngineEventSink> AudioEngine<E> {
                                     infer_ms,
                                     drain_count as i64,
                                     drain_audio_ms,
-                                    asr_buffer.len() as i64,
+                                    asr_buffer.len().saturating_sub(asr_consumed) as i64,
                                     is_empty as i64,
                                     preview,
                                     vad_state_str,
@@ -849,8 +868,22 @@ impl<E: EngineEventSink> AudioEngine<E> {
                     }
                 }
             }
+            if asr_consumed > 0 {
+                asr_buffer.drain(..asr_consumed);
+            }
         }
     }
+}
+
+fn take_complete_frames(leftover: &mut Vec<f32>, drained: &[f32], frame_size: usize) -> Vec<f32> {
+    let mut input = std::mem::take(leftover);
+    input.extend_from_slice(drained);
+    let complete_len = input.len() / frame_size * frame_size;
+    if complete_len < input.len() {
+        leftover.extend_from_slice(&input[complete_len..]);
+        input.truncate(complete_len);
+    }
+    input
 }
 
 /// Check if text ends with sentence-ending punctuation (`.`, `?`, `!`),
@@ -933,5 +966,25 @@ mod tests {
         assert!(!ends_with_sentence_punctuation("Hello"));
         assert!(!ends_with_sentence_punctuation("Hello,"));
         assert!(!ends_with_sentence_punctuation("Hello;"));
+    }
+
+    #[test]
+    fn take_complete_frames_preserves_leftover_order() {
+        let mut leftover = vec![1.0, 2.0];
+
+        let complete = take_complete_frames(&mut leftover, &[3.0, 4.0, 5.0], 4);
+
+        assert_eq!(complete, vec![1.0, 2.0, 3.0, 4.0]);
+        assert_eq!(leftover, vec![5.0]);
+    }
+
+    #[test]
+    fn take_complete_frames_keeps_all_incomplete_input_as_leftover() {
+        let mut leftover = vec![1.0];
+
+        let complete = take_complete_frames(&mut leftover, &[2.0], 4);
+
+        assert!(complete.is_empty());
+        assert_eq!(leftover, vec![1.0, 2.0]);
     }
 }
