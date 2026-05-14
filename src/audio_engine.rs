@@ -28,6 +28,12 @@ struct ReplayBuffer {
     max_chunks: usize,
 }
 
+struct PendingSpeechEndReset {
+    reset_after_samples: usize,
+    uptime_ms: i64,
+    speech_duration_ms: f64,
+}
+
 impl ReplayBuffer {
     fn new(max_chunks: usize) -> Self {
         Self {
@@ -541,6 +547,7 @@ impl<E: EngineEventSink> AudioEngine<E> {
         let mut punctuation_reset_enabled = settings.punctuation_reset;
         let mut empty_reset_threshold = settings.empty_reset_threshold;
         let mut replay_buffer = ReplayBuffer::new(empty_reset_threshold as usize);
+        let mut pending_speech_end_resets: VecDeque<PendingSpeechEndReset> = VecDeque::new();
 
         let mut model = if let Some(mut m) = cached_nemotron {
             println!("Using cached Nemotron model (skipping reload)");
@@ -799,41 +806,14 @@ impl<E: EngineEventSink> AudioEngine<E> {
                             .map(|start| (uptime - start) as f64)
                             .unwrap_or(0.0);
 
-                        if let Some(db) =
-                            db.as_ref().filter(|_| diag_enabled.load(Ordering::Relaxed))
-                        {
-                            let chunks_at_reset = chunks_since_decoder_reset as i64;
-                            let _ = db.execute(
-                                "INSERT INTO vad_events (
-                                    session_id, uptime_ms, event_type, speech_duration_ms,
-                                    consecutive_empty, chunks_since_decoder_reset,
-                                    audio_ms_since_decoder_reset
-                                 )
-                                 VALUES (?1, ?2, 'speech_end', ?3, ?4, ?5, ?6)",
-                                rusqlite::params![
-                                    session_id,
-                                    uptime,
-                                    duration_ms,
-                                    consecutive_empty as i64,
-                                    chunks_at_reset,
-                                    chunks_to_audio_ms(
-                                        chunks_since_decoder_reset,
-                                        settings.chunk_ms
-                                    ),
-                                ],
-                            );
-                        }
-
-                        // Flush remaining asr_buffer: pad final sub-chunk if needed
-                        if !asr_buffer.is_empty() && asr_buffer.len() < chunk_size {
-                            asr_buffer.resize(chunk_size, 0.0);
-                        }
+                        pad_to_chunk_boundary(&mut asr_buffer, chunk_size);
+                        pending_speech_end_resets.push_back(PendingSpeechEndReset {
+                            reset_after_samples: asr_buffer.len(),
+                            uptime_ms: uptime,
+                            speech_duration_ms: duration_ms,
+                        });
 
                         speech_start_uptime_ms = None;
-                        consecutive_empty = 0;
-                        model.reset();
-                        chunks_since_decoder_reset = 0;
-                        replay_buffer.clear();
                     }
                 }
             }
@@ -1079,6 +1059,40 @@ impl<E: EngineEventSink> AudioEngine<E> {
                         }
                     }
                 }
+
+                while pending_speech_end_resets
+                    .front()
+                    .is_some_and(|reset| asr_consumed >= reset.reset_after_samples)
+                {
+                    let reset = pending_speech_end_resets
+                        .pop_front()
+                        .expect("front checked above");
+
+                    if let Some(db) = db.as_ref().filter(|_| diag_enabled.load(Ordering::Relaxed)) {
+                        let chunks_at_reset = chunks_since_decoder_reset as i64;
+                        let _ = db.execute(
+                            "INSERT INTO vad_events (
+                                session_id, uptime_ms, event_type, speech_duration_ms,
+                                consecutive_empty, chunks_since_decoder_reset,
+                                audio_ms_since_decoder_reset
+                             )
+                             VALUES (?1, ?2, 'speech_end', ?3, ?4, ?5, ?6)",
+                            rusqlite::params![
+                                session_id,
+                                reset.uptime_ms,
+                                reset.speech_duration_ms,
+                                consecutive_empty as i64,
+                                chunks_at_reset,
+                                chunks_to_audio_ms(chunks_since_decoder_reset, settings.chunk_ms),
+                            ],
+                        );
+                    }
+
+                    consecutive_empty = 0;
+                    model.reset();
+                    chunks_since_decoder_reset = 0;
+                    replay_buffer.clear();
+                }
             }
             if asr_consumed > 0 {
                 asr_buffer.drain(..asr_consumed);
@@ -1096,6 +1110,16 @@ fn take_complete_frames(leftover: &mut Vec<f32>, drained: &[f32], frame_size: us
         input.truncate(complete_len);
     }
     input
+}
+
+fn pad_to_chunk_boundary(buffer: &mut Vec<f32>, chunk_size: usize) {
+    if buffer.is_empty() || chunk_size == 0 {
+        return;
+    }
+    let remainder = buffer.len() % chunk_size;
+    if remainder != 0 {
+        buffer.resize(buffer.len() + chunk_size - remainder, 0.0);
+    }
 }
 
 fn chunks_to_audio_ms(chunks: u64, chunk_ms: usize) -> i64 {
@@ -1224,6 +1248,33 @@ mod tests {
 
         assert!(complete.is_empty());
         assert_eq!(leftover, vec![1.0, 2.0]);
+    }
+
+    #[test]
+    fn pad_to_chunk_boundary_pads_partial_chunk() {
+        let mut buffer = vec![1.0, 2.0, 3.0, 4.0, 5.0];
+
+        pad_to_chunk_boundary(&mut buffer, 4);
+
+        assert_eq!(buffer, vec![1.0, 2.0, 3.0, 4.0, 5.0, 0.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn pad_to_chunk_boundary_preserves_aligned_buffer() {
+        let mut buffer = vec![1.0, 2.0, 3.0, 4.0];
+
+        pad_to_chunk_boundary(&mut buffer, 4);
+
+        assert_eq!(buffer, vec![1.0, 2.0, 3.0, 4.0]);
+    }
+
+    #[test]
+    fn pad_to_chunk_boundary_preserves_empty_buffer() {
+        let mut buffer = Vec::new();
+
+        pad_to_chunk_boundary(&mut buffer, 4);
+
+        assert!(buffer.is_empty());
     }
 
     #[test]
