@@ -3,6 +3,7 @@ use parakeet_rs::ExecutionProvider;
 use parakeet_rs::{ExecutionConfig, Nemotron};
 use rubato::{FftFixedIn, Resampler};
 use rusqlite::Connection;
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
@@ -21,6 +22,47 @@ use crate::EngineEventSink;
 const VAD_MODEL_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/models/silero_vad.onnx");
 const ASR_SAMPLE_RATE: usize = 16000;
 const VAD_FRAME_SIZE: usize = 512;
+
+struct ReplayBuffer {
+    chunks: VecDeque<Vec<f32>>,
+    max_chunks: usize,
+}
+
+impl ReplayBuffer {
+    fn new(max_chunks: usize) -> Self {
+        Self {
+            chunks: VecDeque::with_capacity(max_chunks),
+            max_chunks,
+        }
+    }
+
+    fn update_capacity(&mut self, max_chunks: usize) {
+        self.max_chunks = max_chunks;
+        self.truncate_to_capacity();
+    }
+
+    fn push(&mut self, chunk: &[f32]) {
+        if self.max_chunks == 0 {
+            return;
+        }
+        self.chunks.push_back(chunk.to_vec());
+        self.truncate_to_capacity();
+    }
+
+    fn clear(&mut self) {
+        self.chunks.clear();
+    }
+
+    fn snapshot(&self) -> Vec<Vec<f32>> {
+        self.chunks.iter().cloned().collect()
+    }
+
+    fn truncate_to_capacity(&mut self) {
+        while self.chunks.len() > self.max_chunks {
+            self.chunks.pop_front();
+        }
+    }
+}
 
 pub enum Command {
     ListDevices {
@@ -410,7 +452,8 @@ impl<E: EngineEventSink> AudioEngine<E> {
                  text_empty INTEGER,
                  text_preview TEXT,
                  error_msg TEXT,
-                 vad_state TEXT
+                 vad_state TEXT,
+                 chunk_source TEXT
              );
              CREATE TABLE IF NOT EXISTS vad_events (
                  id INTEGER PRIMARY KEY,
@@ -423,18 +466,42 @@ impl<E: EngineEventSink> AudioEngine<E> {
                  consecutive_empty INTEGER,
                  probability REAL,
                  chunks_since_decoder_reset INTEGER,
-                 audio_ms_since_decoder_reset INTEGER
+                 audio_ms_since_decoder_reset INTEGER,
+                 replay_chunks INTEGER,
+                 replay_audio_ms INTEGER,
+                 replay_nonempty_chunks INTEGER,
+                 replay_inference_ms INTEGER
              );",
         )?;
         // Migrate: add columns if they don't exist (ALTER TABLE has no IF NOT EXISTS).
-        let _ = conn.execute_batch("ALTER TABLE events ADD COLUMN vad_state TEXT;");
-        let _ = conn.execute_batch("ALTER TABLE events ADD COLUMN vad_ms INTEGER;");
-        let _ = conn.execute_batch("ALTER TABLE events ADD COLUMN resample_ms INTEGER;");
-        let _ = conn.execute_batch("ALTER TABLE events ADD COLUMN iteration_ms INTEGER;");
-        let _ = conn
-            .execute_batch("ALTER TABLE vad_events ADD COLUMN chunks_since_decoder_reset INTEGER;");
-        let _ = conn.execute_batch(
+        migrate_add_column(&conn, "ALTER TABLE events ADD COLUMN vad_state TEXT;");
+        migrate_add_column(&conn, "ALTER TABLE events ADD COLUMN vad_ms INTEGER;");
+        migrate_add_column(&conn, "ALTER TABLE events ADD COLUMN resample_ms INTEGER;");
+        migrate_add_column(&conn, "ALTER TABLE events ADD COLUMN iteration_ms INTEGER;");
+        migrate_add_column(&conn, "ALTER TABLE events ADD COLUMN chunk_source TEXT;");
+        migrate_add_column(
+            &conn,
+            "ALTER TABLE vad_events ADD COLUMN chunks_since_decoder_reset INTEGER;",
+        );
+        migrate_add_column(
+            &conn,
             "ALTER TABLE vad_events ADD COLUMN audio_ms_since_decoder_reset INTEGER;",
+        );
+        migrate_add_column(
+            &conn,
+            "ALTER TABLE vad_events ADD COLUMN replay_chunks INTEGER;",
+        );
+        migrate_add_column(
+            &conn,
+            "ALTER TABLE vad_events ADD COLUMN replay_audio_ms INTEGER;",
+        );
+        migrate_add_column(
+            &conn,
+            "ALTER TABLE vad_events ADD COLUMN replay_nonempty_chunks INTEGER;",
+        );
+        migrate_add_column(
+            &conn,
+            "ALTER TABLE vad_events ADD COLUMN replay_inference_ms INTEGER;",
         );
         Ok(Some(conn))
     }
@@ -473,6 +540,7 @@ impl<E: EngineEventSink> AudioEngine<E> {
 
         let mut punctuation_reset_enabled = settings.punctuation_reset;
         let mut empty_reset_threshold = settings.empty_reset_threshold;
+        let mut replay_buffer = ReplayBuffer::new(empty_reset_threshold as usize);
 
         let mut model = if let Some(mut m) = cached_nemotron {
             println!("Using cached Nemotron model (skipping reload)");
@@ -575,6 +643,7 @@ impl<E: EngineEventSink> AudioEngine<E> {
                 );
                 punctuation_reset_enabled = new_settings.punctuation_reset;
                 empty_reset_threshold = new_settings.empty_reset_threshold;
+                replay_buffer.update_capacity(empty_reset_threshold as usize);
                 vad.update_params(
                     new_settings.vad_threshold_start,
                     new_settings.vad_threshold_end,
@@ -703,6 +772,7 @@ impl<E: EngineEventSink> AudioEngine<E> {
                         let uptime = loop_start.elapsed().as_millis() as i64;
                         speech_start_uptime_ms = Some(uptime);
                         consecutive_empty = 0;
+                        replay_buffer.clear();
 
                         if let Some(db) =
                             db.as_ref().filter(|_| diag_enabled.load(Ordering::Relaxed))
@@ -763,6 +833,7 @@ impl<E: EngineEventSink> AudioEngine<E> {
                         consecutive_empty = 0;
                         model.reset();
                         chunks_since_decoder_reset = 0;
+                        replay_buffer.clear();
                     }
                 }
             }
@@ -784,6 +855,10 @@ impl<E: EngineEventSink> AudioEngine<E> {
             while asr_buffer.len().saturating_sub(asr_consumed) >= chunk_size {
                 let chunk = &asr_buffer[asr_consumed..asr_consumed + chunk_size];
                 asr_consumed += chunk_size;
+                let vad_is_speech = vad.state() == VadState::Speech;
+                if vad_is_speech {
+                    replay_buffer.push(chunk);
+                }
                 chunks_since_decoder_reset += 1;
                 let infer_start = Instant::now();
                 match model.transcribe_chunk(chunk) {
@@ -793,7 +868,7 @@ impl<E: EngineEventSink> AudioEngine<E> {
                         let is_empty = text.is_empty();
                         let preview = text_preview(&text, 200);
 
-                        if is_empty {
+                        if is_empty && vad_is_speech {
                             consecutive_empty += 1;
                         } else {
                             consecutive_empty = 0;
@@ -807,8 +882,8 @@ impl<E: EngineEventSink> AudioEngine<E> {
                                 "INSERT INTO events (session_id, uptime_ms, event_type, chunk_num,
                                  inference_ms, drain_samples, drain_audio_ms,
                                  asr_buf_len, text_empty, text_preview, vad_state,
-                                 vad_ms, resample_ms, iteration_ms)
-                                 VALUES (?1, ?2, 'transcribe', ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                                 vad_ms, resample_ms, iteration_ms, chunk_source)
+                                 VALUES (?1, ?2, 'transcribe', ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
                                 rusqlite::params![
                                     session_id,
                                     loop_start.elapsed().as_millis() as i64,
@@ -823,6 +898,7 @@ impl<E: EngineEventSink> AudioEngine<E> {
                                     vad_ms,
                                     resample_ms,
                                     iteration_ms,
+                                    "live",
                                 ],
                             );
                         }
@@ -858,6 +934,7 @@ impl<E: EngineEventSink> AudioEngine<E> {
                             model.reset();
                             chunks_since_decoder_reset = 0;
                             consecutive_empty = 0;
+                            replay_buffer.clear();
                         }
 
                         if !is_empty {
@@ -865,35 +942,120 @@ impl<E: EngineEventSink> AudioEngine<E> {
                         }
 
                         // Mid-speech reset heuristic
-                        if consecutive_empty >= empty_reset_threshold
-                            && vad.state() == VadState::Speech
-                        {
-                            if let Some(db) =
-                                db.as_ref().filter(|_| diag_enabled.load(Ordering::Relaxed))
-                            {
-                                let uptime = loop_start.elapsed().as_millis() as i64;
-                                let chunks_at_reset = chunks_since_decoder_reset as i64;
-                                let _ = db.execute(
-                                    "INSERT INTO vad_events (
-                                        session_id, uptime_ms, event_type, consecutive_empty,
-                                        chunks_since_decoder_reset, audio_ms_since_decoder_reset
-                                     )
-                                     VALUES (?1, ?2, 'mid_speech_reset', ?3, ?4, ?5)",
-                                    rusqlite::params![
-                                        session_id,
-                                        uptime,
-                                        consecutive_empty as i64,
-                                        chunks_at_reset,
-                                        chunks_to_audio_ms(
-                                            chunks_since_decoder_reset,
-                                            settings.chunk_ms
-                                        ),
-                                    ],
-                                );
-                            }
+                        if consecutive_empty >= empty_reset_threshold && vad_is_speech {
+                            let consecutive_empty_at_reset = consecutive_empty;
+                            let reset_uptime = loop_start.elapsed().as_millis() as i64;
+                            let chunks_at_reset = chunks_since_decoder_reset as i64;
+                            let audio_ms_at_reset =
+                                chunks_to_audio_ms(chunks_since_decoder_reset, settings.chunk_ms);
+                            let replay_chunks = replay_buffer.snapshot();
+                            let replay_chunk_count = replay_chunks.len() as i64;
+                            let replay_audio_ms =
+                                chunks_to_audio_ms(replay_chunks.len() as u64, settings.chunk_ms);
+
                             model.reset();
                             chunks_since_decoder_reset = 0;
                             consecutive_empty = 0;
+                            replay_buffer.clear();
+
+                            let mut replay_nonempty_chunks = 0i64;
+                            let mut replay_inference_ms = 0i64;
+
+                            for replay_chunk in &replay_chunks {
+                                chunks_since_decoder_reset += 1;
+                                let infer_start = Instant::now();
+                                match model.transcribe_chunk(replay_chunk) {
+                                    Ok(text) => {
+                                        let infer_ms = infer_start.elapsed().as_millis() as i64;
+                                        replay_inference_ms += infer_ms;
+                                        chunk_num += 1;
+                                        let is_empty = text.is_empty();
+                                        let preview = text_preview(&text, 200);
+                                        let iteration_ms = iter_start.elapsed().as_millis() as i64;
+
+                                        if let Some(db) = db
+                                            .as_ref()
+                                            .filter(|_| diag_enabled.load(Ordering::Relaxed))
+                                        {
+                                            let _ = db.execute(
+                                                "INSERT INTO events (session_id, uptime_ms, event_type, chunk_num,
+                                                 inference_ms, drain_samples, drain_audio_ms,
+                                                 asr_buf_len, text_empty, text_preview, vad_state,
+                                                 vad_ms, resample_ms, iteration_ms, chunk_source)
+                                                 VALUES (?1, ?2, 'transcribe', ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                                                rusqlite::params![
+                                                    session_id,
+                                                    loop_start.elapsed().as_millis() as i64,
+                                                    chunk_num as i64,
+                                                    infer_ms,
+                                                    drain_count as i64,
+                                                    drain_audio_ms,
+                                                    asr_buffer.len().saturating_sub(asr_consumed)
+                                                        as i64,
+                                                    is_empty as i64,
+                                                    preview,
+                                                    "speech",
+                                                    vad_ms,
+                                                    resample_ms,
+                                                    iteration_ms,
+                                                    "replay",
+                                                ],
+                                            );
+                                        }
+
+                                        if !is_empty {
+                                            replay_nonempty_chunks += 1;
+                                            event_sink.on_transcription(text);
+                                        }
+                                    }
+                                    Err(e) => {
+                                        if let Some(db) = db
+                                            .as_ref()
+                                            .filter(|_| diag_enabled.load(Ordering::Relaxed))
+                                        {
+                                            let _ = db.execute(
+                                                "INSERT INTO events (session_id, uptime_ms, event_type, chunk_num,
+                                                 inference_ms, error_msg, vad_state, chunk_source)
+                                                 VALUES (?1, ?2, 'asr_error', ?3, ?4, ?5, ?6, ?7)",
+                                                rusqlite::params![
+                                                    session_id,
+                                                    loop_start.elapsed().as_millis() as i64,
+                                                    chunk_num as i64,
+                                                    infer_start.elapsed().as_millis() as i64,
+                                                    e.to_string(),
+                                                    "speech",
+                                                    "replay",
+                                                ],
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+
+                            if let Some(db) =
+                                db.as_ref().filter(|_| diag_enabled.load(Ordering::Relaxed))
+                            {
+                                let _ = db.execute(
+                                    "INSERT INTO vad_events (
+                                        session_id, uptime_ms, event_type, consecutive_empty,
+                                        chunks_since_decoder_reset, audio_ms_since_decoder_reset,
+                                        replay_chunks, replay_audio_ms, replay_nonempty_chunks,
+                                        replay_inference_ms
+                                     )
+                                     VALUES (?1, ?2, 'mid_speech_reset', ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                                    rusqlite::params![
+                                        session_id,
+                                        reset_uptime,
+                                        consecutive_empty_at_reset as i64,
+                                        chunks_at_reset,
+                                        audio_ms_at_reset,
+                                        replay_chunk_count,
+                                        replay_audio_ms,
+                                        replay_nonempty_chunks,
+                                        replay_inference_ms,
+                                    ],
+                                );
+                            }
                         }
                     }
                     Err(e) => {
@@ -902,8 +1064,8 @@ impl<E: EngineEventSink> AudioEngine<E> {
                         {
                             let _ = db.execute(
                                 "INSERT INTO events (session_id, uptime_ms, event_type, chunk_num,
-                                 inference_ms, error_msg, vad_state)
-                                 VALUES (?1, ?2, 'asr_error', ?3, ?4, ?5, ?6)",
+                                 inference_ms, error_msg, vad_state, chunk_source)
+                                 VALUES (?1, ?2, 'asr_error', ?3, ?4, ?5, ?6, ?7)",
                                 rusqlite::params![
                                     session_id,
                                     loop_start.elapsed().as_millis() as i64,
@@ -911,6 +1073,7 @@ impl<E: EngineEventSink> AudioEngine<E> {
                                     infer_start.elapsed().as_millis() as i64,
                                     e.to_string(),
                                     vad_state_str,
+                                    "live",
                                 ],
                             );
                         }
@@ -937,6 +1100,14 @@ fn take_complete_frames(leftover: &mut Vec<f32>, drained: &[f32], frame_size: us
 
 fn chunks_to_audio_ms(chunks: u64, chunk_ms: usize) -> i64 {
     chunks.saturating_mul(chunk_ms as u64).min(i64::MAX as u64) as i64
+}
+
+fn migrate_add_column(conn: &Connection, sql: &str) {
+    if let Err(e) = conn.execute_batch(sql) {
+        if !e.to_string().contains("duplicate column name") {
+            eprintln!("[diag] Migration failed for `{}`: {}", sql, e);
+        }
+    }
 }
 
 fn text_preview(text: &str, max_bytes: usize) -> String {
@@ -1073,5 +1244,37 @@ mod tests {
     #[test]
     fn chunks_to_audio_ms_uses_chunk_duration() {
         assert_eq!(chunks_to_audio_ms(6, 560), 3360);
+    }
+
+    #[test]
+    fn replay_buffer_keeps_latest_chunks() {
+        let mut buffer = ReplayBuffer::new(2);
+
+        buffer.push(&[1.0]);
+        buffer.push(&[2.0]);
+        buffer.push(&[3.0]);
+
+        assert_eq!(buffer.snapshot(), vec![vec![2.0], vec![3.0]]);
+    }
+
+    #[test]
+    fn replay_buffer_capacity_update_truncates_old_chunks() {
+        let mut buffer = ReplayBuffer::new(3);
+
+        buffer.push(&[1.0]);
+        buffer.push(&[2.0]);
+        buffer.push(&[3.0]);
+        buffer.update_capacity(1);
+
+        assert_eq!(buffer.snapshot(), vec![vec![3.0]]);
+    }
+
+    #[test]
+    fn replay_buffer_zero_capacity_keeps_no_chunks() {
+        let mut buffer = ReplayBuffer::new(0);
+
+        buffer.push(&[1.0]);
+
+        assert!(buffer.snapshot().is_empty());
     }
 }
