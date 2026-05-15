@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "Core audio/ASR engine for Larmindon transcription tool"
 authors = ["edmistond"]
 edition = "2021"
-license = "MIT"
+license = "GPL-3.0-only"
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }

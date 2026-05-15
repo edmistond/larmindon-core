@@ -67,4 +67,6 @@ Tests cover the VAD state machine, ring buffer, settings validation, punctuation
 
 ## License
 
-MIT
+GPL-3.0-only.
+
+For commercial licensing terms outside the GPLv3, please contact David Edmiston.
