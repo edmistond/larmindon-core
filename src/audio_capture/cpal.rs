@@ -44,8 +44,13 @@ impl AudioCapture for CpalBackend {
         }
 
         // On Windows, WASAPI allows monitoring output devices as loopback inputs.
-        #[cfg(target_os = "windows")]
+        // On macOS, CPAL's CoreAudio backend uses process taps for output capture.
+        #[cfg(any(target_os = "windows", target_os = "macos"))]
         if let Ok(output_devices) = host.output_devices() {
+            let default_output_name = host
+                .default_output_device()
+                .and_then(|d| d.description().ok().map(|desc| desc.name().to_string()));
+
             for device in output_devices {
                 let raw_name = device
                     .description()
@@ -57,7 +62,8 @@ impl AudioCapture for CpalBackend {
                         id: raw_name.clone(),
                         name: format!("[out] {}", raw_name),
                         device_type: DeviceType::Monitor,
-                        is_default: false,
+                        is_default: cfg!(target_os = "macos")
+                            && default_output_name.as_deref() == Some(&raw_name),
                         application_name: None,
                     });
                 }
@@ -75,21 +81,35 @@ impl AudioCapture for CpalBackend {
     ) -> Result<StartedAudioStream, Box<dyn Error>> {
         let host = cpal::default_host();
 
-        let device = if let Some(ref id) = device_id {
-            let find_by_id = |d: &Device| {
-                d.description()
-                    .map(|desc| desc.name() == *id)
-                    .unwrap_or(false)
-            };
-
-            host.input_devices()?
-                .find(find_by_id)
-                .or_else(|| host.output_devices().ok()?.find(find_by_id))
-                .ok_or_else(|| format!("No device found with ID: {}", id))?
+        let (device, is_output_device) = if let Some(ref id) = device_id {
+            if let Some(device) = host.input_devices().ok().and_then(|mut devices| {
+                devices.find(|d| {
+                    d.description()
+                        .map(|desc| desc.name() == *id)
+                        .unwrap_or(false)
+                })
+            }) {
+                (device, false)
+            } else if let Some(device) = host.output_devices().ok().and_then(|mut devices| {
+                devices.find(|d| {
+                    d.description()
+                        .map(|desc| desc.name() == *id)
+                        .unwrap_or(false)
+                })
+            }) {
+                (device, true)
+            } else {
+                return Err(format!("No device found with ID: {}", id).into());
+            }
         } else {
-            host.default_input_device()
-                .ok_or("No default input device found")?
+            (
+                host.default_input_device()
+                    .ok_or("No default input device found")?,
+                false,
+            )
         };
+        #[cfg(not(target_os = "macos"))]
+        let _ = is_output_device;
 
         let device_name = device
             .description()
@@ -115,8 +135,25 @@ impl AudioCapture for CpalBackend {
             channels,
             sample_format: format!("{:?}", sample_format),
         };
-        let stream = build_stream(&device, &stream_config, sample_format, channels, buffer)?;
-        stream.play()?;
+        let stream = match build_stream(&device, &stream_config, sample_format, channels, buffer) {
+            Ok(stream) => stream,
+            Err(err) => {
+                #[cfg(target_os = "macos")]
+                if is_output_device {
+                    return Err(macos_system_audio_error(&device_name, err));
+                }
+
+                return Err(err);
+            }
+        };
+        if let Err(err) = stream.play() {
+            #[cfg(target_os = "macos")]
+            if is_output_device {
+                return Err(macos_system_audio_error(&device_name, err));
+            }
+
+            return Err(err.into());
+        }
 
         Ok(StartedAudioStream {
             stream: Box::new(CpalStream { stream, stop_flag }),
@@ -127,6 +164,15 @@ impl AudioCapture for CpalBackend {
     fn name(&self) -> &'static str {
         "CPAL"
     }
+}
+
+#[cfg(target_os = "macos")]
+fn macos_system_audio_error(device_name: &str, err: impl std::fmt::Display) -> Box<dyn Error> {
+    format!(
+        "Failed to start macOS system audio capture for '{}': {}. Native output capture requires macOS 14.6 or newer and System Audio Recording permission.",
+        device_name, err
+    )
+    .into()
 }
 
 struct CpalStream {
