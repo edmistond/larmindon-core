@@ -572,6 +572,12 @@ impl<E: EngineEventSink> AudioEngine<E> {
                 model_config = model_config.with_execution_provider(ExecutionProvider::WebGPU);
             }
 
+            #[cfg(feature = "directml")]
+            {
+                println!("DirectML feature enabled - using DirectML execution provider");
+                model_config = model_config.with_execution_provider(ExecutionProvider::DirectML);
+            }
+
             let m = Nemotron::from_pretrained(&model_path, Some(model_config))?;
             println!("Model loaded.");
             m
