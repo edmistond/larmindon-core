@@ -8,6 +8,9 @@ use std::error::Error;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
+const INPUT_DEVICE_ID_PREFIX: &str = "input:";
+const OUTPUT_DEVICE_ID_PREFIX: &str = "output:";
+
 pub struct CpalBackend;
 
 pub fn create_backend() -> Box<dyn AudioCapture> {
@@ -33,7 +36,7 @@ impl AudioCapture for CpalBackend {
 
                 if !raw_name.is_empty() {
                     devices.push(AudioDevice {
-                        id: raw_name.clone(),
+                        id: cpal_device_id(DeviceType::Input, &raw_name),
                         name: format!("[in] {}", raw_name),
                         device_type: DeviceType::Input,
                         is_default: default_input_name.as_deref() == Some(&raw_name),
@@ -59,7 +62,7 @@ impl AudioCapture for CpalBackend {
 
                 if !raw_name.is_empty() {
                     devices.push(AudioDevice {
-                        id: raw_name.clone(),
+                        id: cpal_device_id(DeviceType::Monitor, &raw_name),
                         name: format!("[out] {}", raw_name),
                         device_type: DeviceType::Monitor,
                         is_default: cfg!(target_os = "macos")
@@ -82,24 +85,33 @@ impl AudioCapture for CpalBackend {
         let host = cpal::default_host();
 
         let (device, is_output_device) = if let Some(ref id) = device_id {
-            if let Some(device) = host.input_devices().ok().and_then(|mut devices| {
-                devices.find(|d| {
-                    d.description()
-                        .map(|desc| desc.name() == *id)
-                        .unwrap_or(false)
-                })
-            }) {
-                (device, false)
-            } else if let Some(device) = host.output_devices().ok().and_then(|mut devices| {
-                devices.find(|d| {
-                    d.description()
-                        .map(|desc| desc.name() == *id)
-                        .unwrap_or(false)
-                })
-            }) {
-                (device, true)
-            } else {
-                return Err(format!("No device found with ID: {}", id).into());
+            match parse_cpal_device_id(id) {
+                Some((DeviceType::Input, raw_name)) => {
+                    let device = find_input_device(&host, raw_name)
+                        .ok_or_else(|| format!("No input device found with ID: {}", id))?;
+                    (device, false)
+                }
+                Some((DeviceType::Monitor, raw_name)) => {
+                    let device = find_output_device(&host, raw_name)
+                        .ok_or_else(|| format!("No output device found with ID: {}", id))?;
+                    (device, true)
+                }
+                Some((DeviceType::Application, _)) => {
+                    return Err(
+                        format!("CPAL does not support application device ID: {}", id).into(),
+                    );
+                }
+                None => {
+                    // Backward compatibility for persisted selections from before CPAL
+                    // device IDs included their direction.
+                    if let Some(device) = find_input_device(&host, id) {
+                        (device, false)
+                    } else if let Some(device) = find_output_device(&host, id) {
+                        (device, true)
+                    } else {
+                        return Err(format!("No device found with ID: {}", id).into());
+                    }
+                }
             }
         } else {
             (
@@ -166,6 +178,43 @@ impl AudioCapture for CpalBackend {
     }
 }
 
+fn cpal_device_id(device_type: DeviceType, raw_name: &str) -> String {
+    match device_type {
+        DeviceType::Input => format!("{}{}", INPUT_DEVICE_ID_PREFIX, raw_name),
+        DeviceType::Monitor => format!("{}{}", OUTPUT_DEVICE_ID_PREFIX, raw_name),
+        DeviceType::Application => raw_name.to_string(),
+    }
+}
+
+fn parse_cpal_device_id(id: &str) -> Option<(DeviceType, &str)> {
+    if let Some(raw_name) = id.strip_prefix(INPUT_DEVICE_ID_PREFIX) {
+        Some((DeviceType::Input, raw_name))
+    } else if let Some(raw_name) = id.strip_prefix(OUTPUT_DEVICE_ID_PREFIX) {
+        Some((DeviceType::Monitor, raw_name))
+    } else {
+        None
+    }
+}
+
+fn find_input_device(host: &cpal::Host, raw_name: &str) -> Option<Device> {
+    host.input_devices()
+        .ok()?
+        .find(|d| device_name_matches(d, raw_name))
+}
+
+fn find_output_device(host: &cpal::Host, raw_name: &str) -> Option<Device> {
+    host.output_devices()
+        .ok()?
+        .find(|d| device_name_matches(d, raw_name))
+}
+
+fn device_name_matches(device: &Device, raw_name: &str) -> bool {
+    device
+        .description()
+        .map(|desc| desc.name() == raw_name)
+        .unwrap_or(false)
+}
+
 #[cfg(target_os = "macos")]
 fn macos_system_audio_error(device_name: &str, err: impl std::fmt::Display) -> Box<dyn Error> {
     format!(
@@ -185,6 +234,38 @@ impl AudioStream for CpalStream {
     fn stop(self: Box<Self>) {
         self.stop_flag.store(true, Ordering::Relaxed);
         // Stream is dropped when self is dropped
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cpal_device_ids_include_device_direction() {
+        let raw_name = "L-Phonak hearing aid";
+
+        assert_eq!(
+            cpal_device_id(DeviceType::Input, raw_name),
+            "input:L-Phonak hearing aid"
+        );
+        assert_eq!(
+            cpal_device_id(DeviceType::Monitor, raw_name),
+            "output:L-Phonak hearing aid"
+        );
+    }
+
+    #[test]
+    fn parse_cpal_device_id_preserves_raw_device_name() {
+        assert_eq!(
+            parse_cpal_device_id("input:L-Phonak hearing aid"),
+            Some((DeviceType::Input, "L-Phonak hearing aid"))
+        );
+        assert_eq!(
+            parse_cpal_device_id("output:L-Phonak hearing aid"),
+            Some((DeviceType::Monitor, "L-Phonak hearing aid"))
+        );
+        assert_eq!(parse_cpal_device_id("L-Phonak hearing aid"), None);
     }
 }
 
