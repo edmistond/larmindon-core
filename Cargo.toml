@@ -20,6 +20,21 @@ cpal = { version = "0.17", optional = true }
 pipewire = { version = "0.9", optional = true }
 libspa = { version = "0.9", optional = true }
 
+# Windows-only per-application capture via WASAPI process loopback. These are
+# non-optional and target-gated, so the backend is compiled (and used by default)
+# on Windows, while macOS/Linux builds never reference them. windows 0.62 is
+# already resolved transitively here, so it's reused rather than adding a second
+# version. Features cover audio-session enumeration (IAudioSessionManager2) and
+# process-name resolution.
+[target.'cfg(target_os = "windows")'.dependencies]
+wasapi = "0.23"
+windows = { version = "0.62", features = [
+    "Win32_Media_Audio",
+    "Win32_System_Com",
+    "Win32_System_Threading",
+    "Win32_Foundation",
+] }
+
 [features]
 default = ["cpal", "pipewire"]
 webgpu = ["parakeet-rs/webgpu"]

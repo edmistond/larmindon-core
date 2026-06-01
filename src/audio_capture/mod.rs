@@ -198,6 +198,12 @@ pub mod pipewire;
 #[cfg(feature = "cpal")]
 pub mod cpal;
 
+#[cfg(target_os = "windows")]
+pub mod wasapi_process;
+
+#[cfg(all(target_os = "windows", feature = "cpal"))]
+pub mod windows_composite;
+
 #[cfg(test)]
 mod tests {
     use super::*;
