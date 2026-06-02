@@ -67,10 +67,10 @@ impl Default for Settings {
 impl Settings {
     /// Returns the config directory: ~/.config/larmindon/
     pub fn config_dir() -> PathBuf {
-        if let Ok(home) = std::env::var("HOME") {
-            PathBuf::from(home).join(".config").join("larmindon")
+        if let Some(home) = home_dir() {
+            home.join(".config").join("larmindon")
         } else {
-            // Fallback for non-Unix or missing HOME
+            // Fallback for unusual environments with no discoverable home dir.
             PathBuf::from(".config").join("larmindon")
         }
     }
@@ -289,11 +289,34 @@ impl Settings {
 /// Expand tilde (~) to home directory in a path
 pub fn expand_tilde(path: &str) -> PathBuf {
     if let Some(stripped) = path.strip_prefix("~/") {
-        if let Ok(home) = std::env::var("HOME") {
-            return PathBuf::from(home).join(stripped);
+        if let Some(home) = home_dir() {
+            return home.join(stripped);
         }
     }
     PathBuf::from(path)
+}
+
+fn home_dir() -> Option<PathBuf> {
+    if let Some(path) = env_path("HOME") {
+        return Some(path);
+    }
+    if let Some(path) = env_path("USERPROFILE") {
+        return Some(path);
+    }
+
+    let drive = std::env::var("HOMEDRIVE").ok().filter(|s| !s.is_empty());
+    let path = std::env::var("HOMEPATH").ok().filter(|s| !s.is_empty());
+    match (drive, path) {
+        (Some(drive), Some(path)) => Some(PathBuf::from(format!("{}{}", drive, path))),
+        _ => None,
+    }
+}
+
+fn env_path(key: &str) -> Option<PathBuf> {
+    std::env::var(key)
+        .ok()
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
 }
 
 /// Convert a chunk duration in milliseconds to samples at 16kHz.
@@ -416,7 +439,7 @@ mod tests {
     #[test]
     fn expand_tilde_with_home() {
         let result = expand_tilde("~/some/path");
-        // Should expand to $HOME/some/path (or unchanged if HOME is unset)
+        // Should expand using the platform's home directory environment.
         assert!(!result.to_string_lossy().starts_with("~/"));
     }
 
