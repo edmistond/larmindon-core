@@ -1,18 +1,35 @@
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-const VALID_CHUNK_MS: &[usize] = &[80, 160, 560, 1120];
 const VALID_THEMES: &[&str] = &["light", "dark", "system"];
+
+/// Settings file format version. v1 was flat with Nemotron fields at the top
+/// level; v2 nests per-engine config under `engines`.
+pub const SETTINGS_VERSION: u32 = 2;
+
+/// Engine-specific settings fields that v1 kept at the top level and v2 moves
+/// into `engines.nemotron`.
+const V1_NEMOTRON_KEYS: &[&str] = &[
+    "model_path",
+    "chunk_ms",
+    "intra_threads",
+    "inter_threads",
+    "punctuation_reset",
+    "empty_reset_threshold",
+];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
-    pub model_path: String,
-    pub chunk_ms: usize,
-    pub intra_threads: usize,
-    pub inter_threads: usize,
-    pub punctuation_reset: bool,
-    pub empty_reset_threshold: u32,
+    pub version: u32,
+    /// Id of the speech engine used for new sessions.
+    pub active_engine: String,
+    /// Per-engine config blobs, keyed by engine id. Each blob's schema is
+    /// owned by the engine crate; entries for engines this build doesn't
+    /// include are preserved untouched so the file stays stable across
+    /// feature-different builds.
+    pub engines: BTreeMap<String, serde_json::Value>,
     /// Font family for transcript display. Empty string = use default.
     pub font_family: String,
     /// Font size in px for transcript display. 0 = use default.
@@ -42,12 +59,9 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            model_path: "~/projects/prs-nemotron/".to_string(),
-            chunk_ms: 560,
-            intra_threads: 2,
-            inter_threads: 1,
-            punctuation_reset: true,
-            empty_reset_threshold: 6,
+            version: SETTINGS_VERSION,
+            active_engine: "nemotron".to_string(),
+            engines: BTreeMap::new(),
             font_family: String::new(),
             font_size_px: 0,
             theme_mode: "dark".to_string(),
@@ -85,25 +99,62 @@ impl Settings {
     }
 
     /// Load settings from disk, falling back to defaults on any error.
+    /// A v1 (flat) file is migrated in place: the Nemotron-specific fields
+    /// move under `engines.nemotron`, the original is backed up to
+    /// `settings.json.v1.bak`, and the migrated form is written back.
     pub fn load() -> Self {
         let path = Self::settings_path();
-        match std::fs::read_to_string(&path) {
-            Ok(contents) => match serde_json::from_str::<Settings>(&contents) {
-                Ok(settings) => {
-                    println!("Loaded settings from {}", path.display());
-                    settings
-                }
-                Err(e) => {
-                    eprintln!(
-                        "Failed to parse settings from {}: {}. Using defaults.",
-                        path.display(),
-                        e
-                    );
-                    Self::default()
-                }
-            },
+        let contents = match std::fs::read_to_string(&path) {
+            Ok(contents) => contents,
             Err(_) => {
                 println!("No settings file at {}, using defaults.", path.display());
+                return Self::default();
+            }
+        };
+
+        let mut value: serde_json::Value = match serde_json::from_str(&contents) {
+            Ok(value) => value,
+            Err(e) => {
+                eprintln!(
+                    "Failed to parse settings from {}: {}. Using defaults.",
+                    path.display(),
+                    e
+                );
+                return Self::default();
+            }
+        };
+
+        let migrated = migrate_v1_to_v2(&mut value);
+
+        match serde_json::from_value::<Settings>(value) {
+            Ok(settings) => {
+                println!("Loaded settings from {}", path.display());
+                if migrated {
+                    let backup = path.with_extension("json.v1.bak");
+                    if let Err(e) = std::fs::write(&backup, &contents) {
+                        eprintln!(
+                            "Failed to back up v1 settings to {}: {}",
+                            backup.display(),
+                            e
+                        );
+                    } else {
+                        println!(
+                            "Migrated v1 settings; original backed up to {}",
+                            backup.display()
+                        );
+                    }
+                    if let Err(e) = settings.save() {
+                        eprintln!("Failed to save migrated settings: {}", e);
+                    }
+                }
+                settings
+            }
+            Err(e) => {
+                eprintln!(
+                    "Failed to interpret settings from {}: {}. Using defaults.",
+                    path.display(),
+                    e
+                );
                 Self::default()
             }
         }
@@ -127,83 +178,11 @@ impl Settings {
         Ok(())
     }
 
-    /// Apply environment variable overrides on top of the current settings.
-    /// Priority: env var > saved setting > default.
-    pub fn with_env_overrides(mut self) -> Self {
-        if let Ok(val) = std::env::var("CHUNK_MS") {
-            if let Ok(ms) = val.parse::<usize>() {
-                if VALID_CHUNK_MS.contains(&ms) {
-                    println!("Using CHUNK_MS={ms}ms from environment");
-                    self.chunk_ms = ms;
-                } else {
-                    eprintln!(
-                        "Invalid CHUNK_MS={ms}; must be one of {:?}. Keeping saved value {}ms.",
-                        VALID_CHUNK_MS, self.chunk_ms
-                    );
-                }
-            } else {
-                eprintln!("Could not parse CHUNK_MS={val:?}. Keeping saved value.");
-            }
-        }
-
-        if let Ok(val) = std::env::var("INTRA_THREADS") {
-            match val.parse::<usize>() {
-                Ok(n) if n >= 1 => {
-                    println!("Using INTRA_THREADS={n} from environment");
-                    self.intra_threads = n;
-                }
-                _ => eprintln!("Invalid INTRA_THREADS={val:?}, keeping saved value."),
-            }
-        }
-
-        if let Ok(val) = std::env::var("INTER_THREADS") {
-            match val.parse::<usize>() {
-                Ok(n) if n >= 1 => {
-                    println!("Using INTER_THREADS={n} from environment");
-                    self.inter_threads = n;
-                }
-                _ => eprintln!("Invalid INTER_THREADS={val:?}, keeping saved value."),
-            }
-        }
-
-        if let Ok(val) = std::env::var("PUNCTUATION_RESET") {
-            match val.to_lowercase().as_str() {
-                "0" | "false" | "no" => {
-                    println!(
-                        "Punctuation-based decoder reset DISABLED via PUNCTUATION_RESET={val}"
-                    );
-                    self.punctuation_reset = false;
-                }
-                "1" | "true" | "yes" => {
-                    println!("Punctuation-based decoder reset ENABLED via PUNCTUATION_RESET={val}");
-                    self.punctuation_reset = true;
-                }
-                _ => eprintln!("Unknown PUNCTUATION_RESET={val:?}, keeping saved value."),
-            }
-        }
-
-        self
-    }
-
-    /// Validate that settings values are within acceptable ranges.
+    /// Validate the shared (engine-independent) fields. Engine config blobs
+    /// are validated by their factories via the engine registry.
     pub fn validate(&self) -> Result<(), String> {
-        if !VALID_CHUNK_MS.contains(&self.chunk_ms) {
-            return Err(format!(
-                "Invalid chunk_ms {}; must be one of {:?}",
-                self.chunk_ms, VALID_CHUNK_MS
-            ));
-        }
-        if self.intra_threads < 1 {
-            return Err("intra_threads must be at least 1".to_string());
-        }
-        if self.inter_threads < 1 {
-            return Err("inter_threads must be at least 1".to_string());
-        }
-        if self.empty_reset_threshold < 1 {
-            return Err("empty_reset_threshold must be at least 1".to_string());
-        }
-        if self.model_path.trim().is_empty() {
-            return Err("model_path cannot be empty".to_string());
+        if self.active_engine.trim().is_empty() {
+            return Err("active_engine cannot be empty".to_string());
         }
         if !VALID_THEMES.contains(&self.theme_mode.as_str()) {
             return Err(format!(
@@ -276,14 +255,38 @@ impl Settings {
             ));
         }
 
-        // Warn (but don't error) if model path doesn't exist
-        let expanded = expand_tilde(&self.model_path);
-        if !expanded.exists() {
-            eprintln!("Warning: model path {} does not exist", expanded.display());
-        }
-
         Ok(())
     }
+
+    /// Config blob for the given engine, if one is stored.
+    pub fn engine_config(&self, engine_id: &str) -> Option<&serde_json::Value> {
+        self.engines.get(engine_id)
+    }
+}
+
+/// Rewrite a v1 (flat) settings JSON value into the v2 nested shape in place.
+/// Returns true if a migration was performed. v2 files pass through untouched.
+fn migrate_v1_to_v2(value: &mut serde_json::Value) -> bool {
+    let Some(obj) = value.as_object_mut() else {
+        return false;
+    };
+    if obj.contains_key("engines") {
+        return false;
+    }
+
+    let mut nemotron = serde_json::Map::new();
+    for key in V1_NEMOTRON_KEYS {
+        if let Some(v) = obj.remove(*key) {
+            nemotron.insert(key.to_string(), v);
+        }
+    }
+
+    let mut engines = serde_json::Map::new();
+    engines.insert("nemotron".to_string(), nemotron.into());
+    obj.insert("engines".to_string(), engines.into());
+    obj.insert("active_engine".to_string(), "nemotron".into());
+    obj.insert("version".to_string(), SETTINGS_VERSION.into());
+    true
 }
 
 /// Expand tilde (~) to home directory in a path
@@ -335,52 +338,11 @@ mod tests {
     }
 
     #[test]
-    fn validate_rejects_invalid_chunk_ms() {
+    fn validate_rejects_empty_active_engine() {
         let mut s = Settings::default();
-        s.chunk_ms = 999;
+        s.active_engine = "  ".to_string();
         assert!(s.validate().is_err());
-        assert!(s.validate().unwrap_err().contains("chunk_ms"));
-    }
-
-    #[test]
-    fn validate_accepts_all_valid_chunk_ms() {
-        for &ms in &[80, 160, 560, 1120] {
-            let mut s = Settings::default();
-            s.chunk_ms = ms;
-            assert!(s.validate().is_ok(), "chunk_ms={} should be valid", ms);
-        }
-    }
-
-    #[test]
-    fn validate_rejects_zero_intra_threads() {
-        let mut s = Settings::default();
-        s.intra_threads = 0;
-        assert!(s.validate().is_err());
-        assert!(s.validate().unwrap_err().contains("intra_threads"));
-    }
-
-    #[test]
-    fn validate_rejects_zero_inter_threads() {
-        let mut s = Settings::default();
-        s.inter_threads = 0;
-        assert!(s.validate().is_err());
-        assert!(s.validate().unwrap_err().contains("inter_threads"));
-    }
-
-    #[test]
-    fn validate_rejects_zero_empty_reset_threshold() {
-        let mut s = Settings::default();
-        s.empty_reset_threshold = 0;
-        assert!(s.validate().is_err());
-        assert!(s.validate().unwrap_err().contains("empty_reset_threshold"));
-    }
-
-    #[test]
-    fn validate_rejects_empty_model_path() {
-        let mut s = Settings::default();
-        s.model_path = "   ".to_string();
-        assert!(s.validate().is_err());
-        assert!(s.validate().unwrap_err().contains("model_path"));
+        assert!(s.validate().unwrap_err().contains("active_engine"));
     }
 
     #[test]
@@ -457,22 +419,101 @@ mod tests {
 
     #[test]
     fn serde_roundtrip() {
-        let settings = Settings::default();
+        let mut settings = Settings::default();
+        settings
+            .engines
+            .insert("nemotron".to_string(), serde_json::json!({"chunk_ms": 160}));
         let json = serde_json::to_string(&settings).unwrap();
         let deserialized: Settings = serde_json::from_str(&json).unwrap();
-        assert_eq!(deserialized.chunk_ms, settings.chunk_ms);
-        assert_eq!(deserialized.model_path, settings.model_path);
+        assert_eq!(deserialized.active_engine, settings.active_engine);
         assert_eq!(deserialized.theme_mode, settings.theme_mode);
+        assert_eq!(
+            deserialized.engines["nemotron"]["chunk_ms"],
+            serde_json::json!(160)
+        );
     }
 
     #[test]
     fn serde_missing_fields_use_defaults() {
         // Simulate a settings file that only has some fields
-        let json = r#"{"chunk_ms": 160}"#;
+        let json = r#"{"font_size_px": 18, "engines": {}}"#;
         let settings: Settings = serde_json::from_str(json).unwrap();
-        assert_eq!(settings.chunk_ms, 160);
+        assert_eq!(settings.font_size_px, 18);
         // All other fields should be defaults
-        assert_eq!(settings.intra_threads, 2);
-        assert!(settings.punctuation_reset);
+        assert_eq!(settings.active_engine, "nemotron");
+        assert_eq!(settings.version, SETTINGS_VERSION);
+    }
+
+    #[test]
+    fn migrate_lifts_v1_engine_fields_into_nemotron_blob() {
+        let mut value = serde_json::json!({
+            "model_path": "/models/nemotron",
+            "chunk_ms": 160,
+            "intra_threads": 4,
+            "inter_threads": 2,
+            "punctuation_reset": false,
+            "empty_reset_threshold": 9,
+            "theme_mode": "light",
+            "font_size_px": 28
+        });
+
+        assert!(migrate_v1_to_v2(&mut value));
+
+        let settings: Settings = serde_json::from_value(value).unwrap();
+        assert_eq!(settings.version, SETTINGS_VERSION);
+        assert_eq!(settings.active_engine, "nemotron");
+        assert_eq!(settings.theme_mode, "light");
+        assert_eq!(settings.font_size_px, 28);
+        let nemotron = &settings.engines["nemotron"];
+        assert_eq!(nemotron["model_path"], "/models/nemotron");
+        assert_eq!(nemotron["chunk_ms"], 160);
+        assert_eq!(nemotron["intra_threads"], 4);
+        assert_eq!(nemotron["inter_threads"], 2);
+        assert_eq!(nemotron["punctuation_reset"], false);
+        assert_eq!(nemotron["empty_reset_threshold"], 9);
+    }
+
+    #[test]
+    fn migrate_is_idempotent_on_v2_files() {
+        let mut value = serde_json::json!({
+            "version": 2,
+            "active_engine": "april",
+            "engines": { "april": { "model_path": "/m.april" } }
+        });
+
+        assert!(!migrate_v1_to_v2(&mut value));
+
+        let settings: Settings = serde_json::from_value(value).unwrap();
+        assert_eq!(settings.active_engine, "april");
+    }
+
+    #[test]
+    fn migrate_handles_partial_v1_files() {
+        let mut value = serde_json::json!({ "chunk_ms": 1120 });
+
+        assert!(migrate_v1_to_v2(&mut value));
+
+        let settings: Settings = serde_json::from_value(value).unwrap();
+        let nemotron = &settings.engines["nemotron"];
+        assert_eq!(nemotron["chunk_ms"], 1120);
+        // Fields absent in v1 stay absent in the blob; the engine's serde
+        // defaults fill them at parse time.
+        assert!(nemotron.get("model_path").is_none());
+    }
+
+    #[test]
+    fn unknown_engine_blobs_survive_roundtrip() {
+        let json = r#"{
+            "version": 2,
+            "active_engine": "nemotron",
+            "engines": {
+                "nemotron": { "chunk_ms": 560 },
+                "some-future-engine": { "api_key": "keep-me" }
+            }
+        }"#;
+        let settings: Settings = serde_json::from_str(json).unwrap();
+        let out = serde_json::to_string(&settings).unwrap();
+        assert!(out.contains("some-future-engine"));
+        assert!(out.contains("keep-me"));
     }
 }

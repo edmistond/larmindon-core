@@ -165,16 +165,19 @@ impl<E: EngineEventSink> AudioEngine<E> {
         device_id: Option<String>,
         settings: Settings,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let engine_id = self
-            .registry
-            .default_engine_id()
-            .ok_or("No speech engine registered")?
-            .to_string();
-        let factory = self
-            .registry
-            .get(&engine_id)
-            .ok_or_else(|| format!("Speech engine '{}' not registered", engine_id))?;
-        let engine_config = engine_config_from_settings(&settings);
+        let engine_id = settings.active_engine.clone();
+        let factory = self.registry.get(&engine_id).ok_or_else(|| {
+            let available: Vec<&str> = self.registry.descriptors().iter().map(|d| d.id).collect();
+            format!(
+                "Speech engine '{}' is not available in this build (available: {})",
+                engine_id,
+                available.join(", ")
+            )
+        })?;
+        let engine_config = settings
+            .engine_config(&engine_id)
+            .cloned()
+            .unwrap_or_else(|| factory.default_config());
         factory.validate_config(&engine_config)?;
         let cache_key = factory.cache_key(&engine_config);
 
@@ -526,7 +529,9 @@ impl<E: EngineEventSink> AudioEngine<E> {
                     new_settings.agc_attack_ms,
                     new_settings.agc_release_ms,
                 );
-                engine.update_config(&engine_config_from_settings(&new_settings));
+                if let Some(config) = new_settings.engine_config(&engine_id) {
+                    engine.update_config(config);
+                }
             }
 
             let (drained, dropped_samples) = {
@@ -651,21 +656,6 @@ impl<E: EngineEventSink> AudioEngine<E> {
             );
         }
     }
-}
-
-/// Build the active engine's config blob from the flat settings struct.
-///
-/// Phase-1 shim: settings are still flat and Nemotron-shaped. Once settings
-/// gain per-engine sections this becomes `settings.engines[active_engine]`.
-fn engine_config_from_settings(settings: &Settings) -> serde_json::Value {
-    serde_json::json!({
-        "model_path": settings.model_path,
-        "chunk_ms": settings.chunk_ms,
-        "intra_threads": settings.intra_threads,
-        "inter_threads": settings.inter_threads,
-        "punctuation_reset": settings.punctuation_reset,
-        "empty_reset_threshold": settings.empty_reset_threshold,
-    })
 }
 
 fn take_complete_frames(leftover: &mut Vec<f32>, drained: &[f32], frame_size: usize) -> Vec<f32> {
