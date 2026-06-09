@@ -1,44 +1,8 @@
-[package]
-name = "larmindon-core"
-version = "0.1.0"
-description = "Core audio/ASR engine for Larmindon transcription tool"
-authors = ["edmistond"]
-edition = "2021"
-license = "GPL-3.0-only"
+[workspace]
+resolver = "2"
+members = ["crates/larmindon-core"]
 
-[dependencies]
+[workspace.dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-rubato = "0.14"
-parakeet-rs = "0.3.5"
-rusqlite = { version = "0.31", features = ["bundled"] }
-ort = "2.0.0-rc.12"
-ndarray = "0.17"
-cpal = { version = "0.17", optional = true }
-
-[target.'cfg(target_os = "linux")'.dependencies]
-pipewire = { version = "0.9", optional = true }
-libspa = { version = "0.9", optional = true }
-
-# Windows-only per-application capture via WASAPI process loopback. These are
-# non-optional and target-gated, so the backend is compiled (and used by default)
-# on Windows, while macOS/Linux builds never reference them. windows 0.62 is
-# already resolved transitively here, so it's reused rather than adding a second
-# version. Features cover audio-session enumeration (IAudioSessionManager2) and
-# process-name resolution.
-[target.'cfg(target_os = "windows")'.dependencies]
-wasapi = "0.23"
-windows = { version = "0.62", features = [
-    "Win32_Media_Audio",
-    "Win32_System_Com",
-    "Win32_System_Threading",
-    "Win32_Foundation",
-] }
-
-[features]
-default = ["cpal", "pipewire"]
-webgpu = ["parakeet-rs/webgpu"]
-directml = ["parakeet-rs/directml"]
-migraphx = ["parakeet-rs/migraphx"]
-pipewire = ["dep:pipewire", "dep:libspa"]
-cpal = ["dep:cpal"]
+larmindon-core = { path = "crates/larmindon-core" }
