@@ -339,16 +339,20 @@ mod tests {
 
     #[test]
     fn validate_rejects_empty_active_engine() {
-        let mut s = Settings::default();
-        s.active_engine = "  ".to_string();
+        let s = Settings {
+            active_engine: "  ".to_string(),
+            ..Settings::default()
+        };
         assert!(s.validate().is_err());
         assert!(s.validate().unwrap_err().contains("active_engine"));
     }
 
     #[test]
     fn validate_rejects_invalid_theme_mode() {
-        let mut s = Settings::default();
-        s.theme_mode = "neon".to_string();
+        let s = Settings {
+            theme_mode: "neon".to_string(),
+            ..Settings::default()
+        };
         assert!(s.validate().is_err());
         assert!(s.validate().unwrap_err().contains("theme_mode"));
     }
@@ -356,37 +360,47 @@ mod tests {
     #[test]
     fn validate_accepts_all_valid_themes() {
         for theme in &["light", "dark", "system"] {
-            let mut s = Settings::default();
-            s.theme_mode = theme.to_string();
+            let s = Settings {
+                theme_mode: theme.to_string(),
+                ..Settings::default()
+            };
             assert!(s.validate().is_ok(), "theme '{}' should be valid", theme);
         }
     }
 
     #[test]
     fn validate_rejects_vad_threshold_out_of_range() {
-        let mut s = Settings::default();
-        s.vad_threshold_start = 1.5;
+        let s = Settings {
+            vad_threshold_start: 1.5,
+            ..Settings::default()
+        };
         assert!(s.validate().is_err());
 
-        let mut s = Settings::default();
-        s.vad_threshold_end = -0.1;
+        let s = Settings {
+            vad_threshold_end: -0.1,
+            ..Settings::default()
+        };
         assert!(s.validate().is_err());
     }
 
     #[test]
     fn validate_rejects_start_below_end_threshold() {
-        let mut s = Settings::default();
-        s.vad_threshold_start = 0.2;
-        s.vad_threshold_end = 0.5;
+        let s = Settings {
+            vad_threshold_start: 0.2,
+            vad_threshold_end: 0.5,
+            ..Settings::default()
+        };
         assert!(s.validate().is_err());
         assert!(s.validate().unwrap_err().contains("vad_threshold_start"));
     }
 
     #[test]
     fn validate_accepts_equal_thresholds() {
-        let mut s = Settings::default();
-        s.vad_threshold_start = 0.5;
-        s.vad_threshold_end = 0.5;
+        let s = Settings {
+            vad_threshold_start: 0.5,
+            vad_threshold_end: 0.5,
+            ..Settings::default()
+        };
         assert!(s.validate().is_ok());
     }
 

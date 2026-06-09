@@ -497,9 +497,9 @@ impl<E: EngineEventSink> AudioEngine<E> {
         let mut speech_start_uptime_ms: Option<i64> = None;
 
         // Forward engine results to the UI, remapping engine-local segment
-        // ids to global ones. Mid-session engine errors are logged and the
-        // session continues; only `begin_session` failures (and
-        // infrastructure errors) abort the loop.
+        // ids to global ones. Transient engine errors are logged and the
+        // session continues; fatal errors abort the loop so the app can notify
+        // the UI and avoid caching a broken engine.
         let mut tracker = SegmentTracker::new(next_segment_id);
         let mut handle_engine_result =
             |result: Result<Vec<SegmentUpdate>, EngineError>| match result {
@@ -507,16 +507,25 @@ impl<E: EngineEventSink> AudioEngine<E> {
                     for update in updates {
                         event_sink.on_segment_update(tracker.remap(update));
                     }
+                    Ok(())
                 }
-                Err(e) => {
-                    eprintln!("[diag] Engine error: {}", e);
-                    diag.log_error("engine_error", &e.to_string());
+                Err(EngineError::Transient(msg)) => {
+                    let err = EngineError::Transient(msg);
+                    eprintln!("[diag] Engine error: {}", err);
+                    diag.log_error("engine_error", &err.to_string());
+                    Ok(())
+                }
+                Err(EngineError::Fatal(msg)) => {
+                    let err = EngineError::Fatal(msg);
+                    eprintln!("[diag] Engine error: {}", err);
+                    diag.log_error("engine_error", &err.to_string());
+                    Err(err)
                 }
             };
 
         loop {
             if stop_flag.load(Ordering::Relaxed) {
-                handle_engine_result(engine.end_session());
+                handle_engine_result(engine.end_session())?;
                 diag.log_shutdown();
                 return Ok((engine, vad));
             }
@@ -560,7 +569,7 @@ impl<E: EngineEventSink> AudioEngine<E> {
             if drained.is_empty() {
                 // Engines with asynchronous result delivery (callback threads,
                 // sockets) surface results during silence via poll().
-                handle_engine_result(engine.poll());
+                handle_engine_result(engine.poll())?;
                 thread::sleep(std::time::Duration::from_millis(10));
                 continue;
             }
@@ -629,15 +638,15 @@ impl<E: EngineEventSink> AudioEngine<E> {
                         diag.log_speech_start(pre_speech_samples.len());
 
                         engine.on_speech_start();
-                        handle_engine_result(engine.feed(&pre_speech_samples));
-                        handle_engine_result(engine.feed(frame));
+                        handle_engine_result(engine.feed(&pre_speech_samples))?;
+                        handle_engine_result(engine.feed(frame))?;
                     }
                     VadDecision::SpeechContinues => {
-                        handle_engine_result(engine.feed(frame));
+                        handle_engine_result(engine.feed(frame))?;
                     }
                     VadDecision::SpeechEnded => {
-                        handle_engine_result(engine.feed(frame));
-                        handle_engine_result(engine.on_speech_end());
+                        handle_engine_result(engine.feed(frame))?;
+                        handle_engine_result(engine.on_speech_end())?;
 
                         let uptime = loop_start.elapsed().as_millis() as i64;
                         let duration_ms = speech_start_uptime_ms
@@ -656,7 +665,7 @@ impl<E: EngineEventSink> AudioEngine<E> {
                 vad_leftover = vad_input[offset..].to_vec();
             }
 
-            handle_engine_result(engine.poll());
+            handle_engine_result(engine.poll())?;
 
             diag.log_feed(
                 drain_count,

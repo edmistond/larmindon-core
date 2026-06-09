@@ -347,6 +347,7 @@ impl AprilEngine {
                 // The final supersedes any earlier partial drained this tick.
                 pending_partial = None;
                 self.last_partial_text.clear();
+                let had_open_segment = self.current_segment.is_some();
                 let segment_id = self.current_segment.take().unwrap_or_else(|| {
                     let id = self.next_segment_id;
                     self.next_segment_id += 1;
@@ -354,7 +355,7 @@ impl AprilEngine {
                 });
                 self.final_count += 1;
                 self.log_result(&text, true);
-                if !text.is_empty() {
+                if !text.is_empty() || had_open_segment {
                     updates.push(SegmentUpdate {
                         segment_id,
                         text,
@@ -588,10 +589,23 @@ mod tests {
     }
 
     #[test]
-    fn empty_final_closes_segment_without_update() {
+    fn empty_final_closes_open_segment_with_blank_update() {
         let mut e = engine();
-        e.apply_results(vec![(false, "X".into())]);
+        let open = e.apply_results(vec![(false, "X".into())]);
         let updates = e.apply_results(vec![(true, "".into())]);
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].segment_id, open[0].segment_id);
+        assert_eq!(updates[0].text, "");
+        assert!(updates[0].is_final);
+        assert!(e.current_segment.is_none());
+    }
+
+    #[test]
+    fn standalone_empty_final_stays_silent() {
+        let mut e = engine();
+
+        let updates = e.apply_results(vec![(true, "".into())]);
+
         assert!(updates.is_empty());
         assert!(e.current_segment.is_none());
     }
