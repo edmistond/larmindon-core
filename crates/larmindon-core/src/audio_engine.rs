@@ -152,6 +152,17 @@ impl<E: EngineEventSink> AudioEngine<E> {
                 Command::UpdateSettings { settings } => {
                     self.diag_enabled
                         .store(settings.diagnostics_enabled, Ordering::Relaxed);
+                    // Switching engines? Free the old engine's model memory
+                    // right away instead of holding it until the next Start.
+                    if let Some(cached) = &self.cached_engine {
+                        if cached.engine_id != settings.active_engine {
+                            println!(
+                                "Active engine changed to '{}' — dropping cached '{}' engine",
+                                settings.active_engine, cached.engine_id
+                            );
+                            self.cached_engine = None;
+                        }
+                    }
                     if let Some(ref tx) = self.settings_tx {
                         let _ = tx.send(settings);
                     }

@@ -164,8 +164,13 @@ fn april_callback(result: ResultType) {
     }
 }
 
+/// april-asr emits ALL-CAPS text; lowercase it so captions don't shout.
 fn join_tokens(tokens: &[aprilasr::Token]) -> String {
-    tokens.iter().map(|t| t.token()).collect()
+    tokens
+        .iter()
+        .map(|t| t.token())
+        .collect::<String>()
+        .to_lowercase()
 }
 
 struct OpenRequest {
