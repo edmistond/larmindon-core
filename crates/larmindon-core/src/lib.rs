@@ -1,6 +1,8 @@
 pub mod agc;
 pub mod audio_capture;
 pub mod audio_engine;
+pub mod diagnostics;
+pub mod engine;
 pub mod settings;
 pub mod vad;
 

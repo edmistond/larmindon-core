@@ -1,0 +1,19 @@
+[package]
+name = "larmindon-engine-nemotron"
+version = "0.1.0"
+description = "Nemotron (parakeet-rs) speech engine for Larmindon"
+authors = ["edmistond"]
+edition = "2021"
+license = "GPL-3.0-only"
+
+[dependencies]
+larmindon-core = { workspace = true }
+parakeet-rs = "0.3.5"
+rusqlite = { version = "0.31", features = ["bundled"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[features]
+webgpu = ["parakeet-rs/webgpu"]
+directml = ["parakeet-rs/directml"]
+migraphx = ["parakeet-rs/migraphx"]

@@ -473,6 +473,6 @@ mod tests {
         assert_eq!(settings.chunk_ms, 160);
         // All other fields should be defaults
         assert_eq!(settings.intra_threads, 2);
-        assert_eq!(settings.punctuation_reset, true);
+        assert!(settings.punctuation_reset);
     }
 }

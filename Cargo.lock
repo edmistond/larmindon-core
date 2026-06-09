@@ -767,7 +767,6 @@ dependencies = [
  "libspa",
  "ndarray",
  "ort",
- "parakeet-rs",
  "pipewire",
  "rubato",
  "rusqlite",
@@ -775,6 +774,17 @@ dependencies = [
  "serde_json",
  "wasapi",
  "windows",
+]
+
+[[package]]
+name = "larmindon-engine-nemotron"
+version = "0.1.0"
+dependencies = [
+ "larmindon-core",
+ "parakeet-rs",
+ "rusqlite",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
