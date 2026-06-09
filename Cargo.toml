@@ -1,6 +1,10 @@
 [workspace]
 resolver = "2"
-members = ["crates/larmindon-core", "crates/larmindon-engine-nemotron"]
+members = [
+    "crates/larmindon-core",
+    "crates/larmindon-engine-nemotron",
+    "crates/larmindon-engine-april",
+]
 
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }

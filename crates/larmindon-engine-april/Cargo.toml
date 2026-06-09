@@ -1,0 +1,21 @@
+[package]
+name = "larmindon-engine-april"
+version = "0.1.0"
+description = "april-asr speech engine for Larmindon (streaming partial/final results)"
+authors = ["edmistond"]
+edition = "2021"
+license = "GPL-3.0-only"
+
+[dependencies]
+larmindon-core = { workspace = true }
+aprilasr = "0.3"
+rusqlite = { version = "0.31", features = ["bundled"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+# libaprilasr links the system libonnxruntime. The ort crate's default static
+# ONNX Runtime cannot co-reside with it (weak C++/protobuf symbols coalesce
+# across images and segfault), so any build that includes this engine flips
+# the whole graph's `ort` to load-dynamic via feature unification — one shared
+# libonnxruntime for april, Silero VAD, and parakeet-rs alike. The dylib is
+# resolved at runtime through ORT_DYLIB_PATH (see `ensure_ort_dylib`).
+ort = { version = "2.0.0-rc.12", features = ["load-dynamic"] }
