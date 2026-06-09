@@ -7,6 +7,7 @@ pub mod settings;
 pub mod vad;
 
 use audio_capture::AudioDevice;
+use engine::SegmentUpdate;
 
 /// Trait for receiving events from the audio engine.
 ///
@@ -14,8 +15,11 @@ use audio_capture::AudioDevice;
 /// For example, a Tauri app emits events via `AppHandle`, a GTK app sends
 /// via `mpsc::Sender<UiEvent>`, and tests collect into a `Vec`.
 pub trait EngineEventSink: Send + Clone + 'static {
-    /// Called when the ASR model produces transcription text.
-    fn on_transcription(&self, text: String);
+    /// Called when the active engine produces or revises a transcription
+    /// segment. `update.segment_id` is globally unique; a transient segment
+    /// (`is_final: false`) is replaced wholesale by later updates with the
+    /// same id until one arrives with `is_final: true`.
+    fn on_segment_update(&self, update: SegmentUpdate);
 
     /// Called when an error occurs during transcription.
     fn on_error(&self, message: String);

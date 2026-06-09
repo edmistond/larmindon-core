@@ -1,6 +1,6 @@
 use rubato::{FftFixedIn, Resampler};
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -12,6 +12,7 @@ use crate::audio_capture::{
 };
 use crate::diagnostics::DiagSink;
 use crate::engine::registry::EngineRegistry;
+use crate::engine::tracker::SegmentTracker;
 use crate::engine::{EngineError, SegmentUpdate, SessionContext, SpeechEngine};
 use crate::settings::{self, Settings};
 use crate::vad::{VadDecision, VadProcessor};
@@ -70,6 +71,9 @@ pub struct AudioEngine<E: EngineEventSink> {
     /// Identity (engine id, cache key) of the engine running in the active
     /// session, used to label the engine box returned when the thread joins.
     pending_cache_identity: Option<(String, u64)>,
+    /// Global segment id allocator. Survives sessions and engine switches so
+    /// the persistent frontend transcript never sees an id collide.
+    next_segment_id: Arc<AtomicU64>,
     /// Runtime toggle for diagnostics logging. Shared with the active
     /// processing thread so flipping it off takes effect mid-session.
     diag_enabled: Arc<AtomicBool>,
@@ -103,6 +107,7 @@ impl<E: EngineEventSink> AudioEngine<E> {
             cached_engine: None,
             cached_vad: None,
             pending_cache_identity: None,
+            next_segment_id: Arc::new(AtomicU64::new(0)),
             diag_enabled,
         }
     }
@@ -253,6 +258,7 @@ impl<E: EngineEventSink> AudioEngine<E> {
         let diag_enabled_for_thread = Arc::clone(&self.diag_enabled);
         let buffer_for_thread = Arc::clone(&buffer);
         let engine_id_for_thread = engine_id.clone();
+        let next_segment_id = Arc::clone(&self.next_segment_id);
         let processing_thread = thread::spawn(move || {
             println!("[diag] Processing thread started");
             match Self::processing_loop(
@@ -269,6 +275,7 @@ impl<E: EngineEventSink> AudioEngine<E> {
                 settings_rx,
                 diag_db_path,
                 diag_enabled_for_thread,
+                next_segment_id,
             ) {
                 Ok(models) => {
                     println!("[diag] Processing loop exited normally");
@@ -416,6 +423,7 @@ impl<E: EngineEventSink> AudioEngine<E> {
         settings_rx: mpsc::Receiver<Settings>,
         diag_db_path: Option<std::path::PathBuf>,
         diag_enabled: Arc<AtomicBool>,
+        next_segment_id: Arc<AtomicU64>,
     ) -> Result<(Box<dyn SpeechEngine>, VadProcessor), Box<dyn std::error::Error>> {
         let diag = match diag_db_path.as_deref() {
             Some(path) => DiagSink::open(
@@ -474,25 +482,23 @@ impl<E: EngineEventSink> AudioEngine<E> {
         let loop_start = Instant::now();
         let mut speech_start_uptime_ms: Option<i64> = None;
 
-        // Forward engine results to the UI. Mid-session engine errors are
-        // logged and the session continues; only `begin_session` failures (and
+        // Forward engine results to the UI, remapping engine-local segment
+        // ids to global ones. Mid-session engine errors are logged and the
+        // session continues; only `begin_session` failures (and
         // infrastructure errors) abort the loop.
-        let handle_engine_result = |result: Result<Vec<SegmentUpdate>, EngineError>| match result {
-            Ok(updates) => {
-                for update in updates {
-                    if update.is_final && !update.text.is_empty() {
-                        // Phase 1 shim: flatten finalized segments into the
-                        // legacy text event. Replaced by on_segment_update
-                        // once the UI understands segments.
-                        event_sink.on_transcription(update.text);
+        let mut tracker = SegmentTracker::new(next_segment_id);
+        let mut handle_engine_result =
+            |result: Result<Vec<SegmentUpdate>, EngineError>| match result {
+                Ok(updates) => {
+                    for update in updates {
+                        event_sink.on_segment_update(tracker.remap(update));
                     }
                 }
-            }
-            Err(e) => {
-                eprintln!("[diag] Engine error: {}", e);
-                diag.log_error("engine_error", &e.to_string());
-            }
-        };
+                Err(e) => {
+                    eprintln!("[diag] Engine error: {}", e);
+                    diag.log_error("engine_error", &e.to_string());
+                }
+            };
 
         loop {
             if stop_flag.load(Ordering::Relaxed) {

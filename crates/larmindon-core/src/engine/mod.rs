@@ -7,6 +7,7 @@
 //! [`registry::EngineRegistry`] by the application shell.
 
 pub mod registry;
+pub mod tracker;
 
 use crate::diagnostics::DiagSink;
 
