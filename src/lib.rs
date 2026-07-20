@@ -23,4 +23,8 @@ pub trait EngineEventSink: Send + Clone + 'static {
 
     /// Called when the available device list changes (PipeWire watcher).
     fn on_devices_changed(&self, devices: Vec<AudioDevice>);
+
+    /// Called at a UI-friendly cadence with a normalized audio level and the
+    /// current VAD state. Sinks that do not display metering can ignore it.
+    fn on_audio_level(&self, _level: f32, _vad_active: bool) {}
 }

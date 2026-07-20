@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::agc::AgcProcessor;
 use crate::audio_capture::{
@@ -22,6 +22,64 @@ use crate::EngineEventSink;
 const VAD_MODEL_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/models/silero_vad.onnx");
 const ASR_SAMPLE_RATE: usize = 16000;
 const VAD_FRAME_SIZE: usize = 512;
+const AUDIO_LEVEL_EMIT_INTERVAL: Duration = Duration::from_millis(50);
+const AUDIO_LEVEL_FLOOR_DB: f32 = -60.0;
+
+/// Accumulates RMS across processing iterations and emits no faster than the
+/// UI needs. This keeps metering off the capture callback and limits bridge
+/// traffic to 20 events per second.
+struct AudioLevelMeter {
+    sum_squares: f64,
+    sample_count: usize,
+    last_emit: Instant,
+}
+
+impl AudioLevelMeter {
+    fn new(now: Instant) -> Self {
+        Self {
+            sum_squares: 0.0,
+            sample_count: 0,
+            last_emit: now,
+        }
+    }
+
+    fn observe(&mut self, samples: &[f32]) {
+        self.sum_squares += samples
+            .iter()
+            .map(|&sample| {
+                let sample = sample as f64;
+                sample * sample
+            })
+            .sum::<f64>();
+        self.sample_count += samples.len();
+    }
+
+    fn take_level_if_due(&mut self, now: Instant) -> Option<f32> {
+        if now.duration_since(self.last_emit) < AUDIO_LEVEL_EMIT_INTERVAL {
+            return None;
+        }
+
+        let rms = if self.sample_count == 0 {
+            0.0
+        } else {
+            (self.sum_squares / self.sample_count as f64).sqrt() as f32
+        };
+        self.sum_squares = 0.0;
+        self.sample_count = 0;
+        self.last_emit = now;
+
+        Some(normalize_audio_level(rms))
+    }
+}
+
+fn normalize_audio_level(rms: f32) -> f32 {
+    if !rms.is_finite() || rms <= 0.0 {
+        return 0.0;
+    }
+
+    let db = 20.0 * rms.log10();
+    ((db - AUDIO_LEVEL_FLOOR_DB) / -AUDIO_LEVEL_FLOOR_DB).clamp(0.0, 1.0)
+}
 
 struct ReplayBuffer {
     chunks: VecDeque<Vec<f32>>,
@@ -630,6 +688,7 @@ impl<E: EngineEventSink> AudioEngine<E> {
         let mut consecutive_empty: u32 = 0;
         let mut chunks_since_decoder_reset: u64 = 0;
         let mut speech_start_uptime_ms: Option<i64> = None;
+        let mut audio_level_meter = AudioLevelMeter::new(Instant::now());
 
         loop {
             if stop_flag.load(Ordering::Relaxed) {
@@ -743,6 +802,10 @@ impl<E: EngineEventSink> AudioEngine<E> {
 
             let resample_ms = resample_start.elapsed().as_millis() as i64;
 
+            // Meter the captured signal before AGC so the UI reflects the
+            // source's real input level rather than the configured gain.
+            audio_level_meter.observe(&samples_16k);
+
             // --- AGC ---
             agc.process(&mut samples_16k);
 
@@ -836,6 +899,10 @@ impl<E: EngineEventSink> AudioEngine<E> {
                 VadState::Silence => "silence",
                 VadState::Speech => "speech",
             };
+
+            if let Some(level) = audio_level_meter.take_level_if_due(Instant::now()) {
+                event_sink.on_audio_level(level, vad.state() == VadState::Speech);
+            }
 
             let mut asr_consumed = 0;
             while asr_buffer.len().saturating_sub(asr_consumed) >= chunk_size {
@@ -1180,6 +1247,28 @@ pub fn ends_with_sentence_punctuation(text: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn audio_level_maps_floor_and_full_scale() {
+        assert_eq!(normalize_audio_level(0.0), 0.0);
+        assert!((normalize_audio_level(0.001) - 0.0).abs() < f32::EPSILON);
+        assert!((normalize_audio_level(1.0) - 1.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn audio_level_meter_accumulates_until_interval() {
+        let start = Instant::now();
+        let mut meter = AudioLevelMeter::new(start);
+        meter.observe(&[0.1, -0.1, 0.1, -0.1]);
+
+        assert!(meter
+            .take_level_if_due(start + Duration::from_millis(49))
+            .is_none());
+        let level = meter
+            .take_level_if_due(start + AUDIO_LEVEL_EMIT_INTERVAL)
+            .expect("meter should emit at its configured interval");
+        assert!(level > 0.0 && level < 1.0);
+    }
 
     #[test]
     fn period_is_sentence_punctuation() {

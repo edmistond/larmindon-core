@@ -358,7 +358,7 @@ fn process_name(pid: u32) -> Option<String> {
 
             let full = String::from_utf16_lossy(&buf[..size as usize]);
             let base = full
-                .rsplit(|c| c == '\\' || c == '/')
+                .rsplit(['\\', '/'])
                 .next()
                 .unwrap_or(&full);
             if base.is_empty() {
