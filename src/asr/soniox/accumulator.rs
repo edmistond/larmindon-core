@@ -6,12 +6,19 @@
 //!   and never repeated. They accumulate into a pending buffer that flushes as
 //!   a final segment at a sentence terminator, at a speaker change, or on the
 //!   `<end>` marker.
-//! * **Volatile** — one open segment holding the pending durable text plus this
-//!   response's non-final tokens. It is thrown away and rebuilt from scratch on
-//!   every response, so a provisional mistake corrects itself.
+//! * **Volatile** — open segments holding the pending durable text plus this
+//!   response's non-final tokens, split into one segment per speaker. They are
+//!   thrown away and rebuilt from scratch on every response, so a provisional
+//!   mistake corrects itself.
 //!
 //! Non-final tokens are the *complete* provisional tail as of each message, so
 //! the tail is replaced wholesale rather than diffed.
+//!
+//! The volatile lane is split per speaker, and carries *provisional* speaker
+//! labels, for one reason: finalization can lag by seconds, and an attributed
+//! live tail that occasionally corrects itself is worth more than an
+//! unattributed one that is always right. Durable text is still attributed only
+//! from final tokens.
 
 use super::protocol::{SonioxResponse, SonioxToken};
 use crate::asr::{SegmentIds, SpeakerId, TranscriptUpdate};
@@ -24,22 +31,36 @@ const CLOSERS: [char; 7] = ['"', '\'', '”', '’', ')', ']', '}'];
 /// Characters that must not be preceded by an inserted space when joining.
 const NO_SPACE_BEFORE: [char; 11] = ['.', ',', '!', '?', ';', ':', ')', ']', '}', '”', '’'];
 
+/// One contiguous stretch of provisional text attributed to a single speaker.
+///
+/// The volatile lane is a list of these rather than one string, so a tail that
+/// spans a turn boundary becomes two segments the UI can put on separate lines
+/// and label separately — rather than one blob that can carry only one label.
+#[derive(Clone, Debug, PartialEq)]
+struct Run {
+    speaker: Option<String>,
+    text: String,
+}
+
 pub struct Accumulator {
     /// Finalized text not yet flushed into a segment.
     pending: String,
-    /// The latest provisional tail, replaced wholesale by every response.
-    ///
-    /// Retained rather than computed and dropped, because at teardown or before
-    /// a reconnect it is the best text the open segment will ever have — no
-    /// further revision is coming. Dropping it truncates the last utterance,
-    /// which is exactly what a speaker notices.
-    tail: String,
     /// Speaker of the pending text. Only ever set from final tokens.
     pending_speaker: Option<String>,
-    /// Id of the currently open (non-final) segment, allocated lazily.
-    open_id: Option<u64>,
-    /// Whether an open segment was emitted and still needs finalizing.
-    open_emitted: bool,
+    /// The latest provisional runs, rebuilt wholesale by every response.
+    ///
+    /// Retained rather than computed and dropped, because at teardown or before
+    /// a reconnect this is the best text the open segments will ever have — no
+    /// further revision is coming. Dropping it truncates the last utterance,
+    /// which is exactly what a speaker notices.
+    ///
+    /// `open_runs[0]` contains `pending`, so the two must never be flushed
+    /// separately or the durable text is emitted twice.
+    open_runs: Vec<Run>,
+    /// Ids of the currently shown open segments, positionally aligned with
+    /// `open_runs`. Held stable across rebuilds so a segment revises in place
+    /// instead of being retracted and re-created on every response.
+    open_ids: Vec<u64>,
 }
 
 impl Default for Accumulator {
@@ -52,10 +73,9 @@ impl Accumulator {
     pub fn new() -> Self {
         Self {
             pending: String::new(),
-            tail: String::new(),
             pending_speaker: None,
-            open_id: None,
-            open_emitted: false,
+            open_runs: Vec::new(),
+            open_ids: Vec::new(),
         }
     }
 
@@ -106,39 +126,90 @@ impl Accumulator {
         // message's provisional tail. The tail replaces its predecessor
         // wholesale — it is the complete hypothesis as of this response, not a
         // delta — so there is no prefix-diffing to do.
-        self.tail = response
-            .tokens
-            .iter()
-            .filter(|t| !t.is_final && !t.is_special())
-            .map(|t| t.text.as_str())
-            .collect();
+        let runs = self.build_open_runs(response);
+        out.extend(self.publish_open(runs, ids));
 
-        let open_text = format!("{}{}", self.pending, self.tail);
-        if open_text.trim().is_empty() {
-            // Nothing provisional left; drop any open segment by finalizing it
-            // as empty is not allowed, so simply forget the id.
-            if !self.pending.is_empty() {
-                // Pending durable text with no tail still deserves display.
-                let id = *self.open_id.get_or_insert_with(|| ids.next());
-                self.open_emitted = true;
-                out.push(TranscriptUpdate {
-                    segment_id: id,
-                    is_final: false,
-                    text: self.pending.clone(),
-                    speaker: self.pending_speaker.clone().map(SpeakerId),
-                });
-            }
-        } else {
-            let id = *self.open_id.get_or_insert_with(|| ids.next());
-            self.open_emitted = true;
-            out.push(TranscriptUpdate {
-                segment_id: id,
-                is_final: false,
-                text: open_text,
-                speaker: self.pending_speaker.clone().map(SpeakerId),
+        out
+    }
+
+    /// Groups the unflushed durable text and this response's provisional tail
+    /// into per-speaker runs.
+    ///
+    /// Provisional speakers are trusted *here* and nowhere else. They get
+    /// revised on finalization — the fixtures capture a token arriving as
+    /// speaker 2 and finalizing as 1 — but this lane is rebuilt from scratch
+    /// every response, so a mislabel corrects itself within about a second.
+    /// Waiting for a durable label instead would leave the live tail
+    /// unattributed for as long as finalization takes, which is exactly when
+    /// knowing who is talking is most useful.
+    fn build_open_runs(&self, response: &SonioxResponse) -> Vec<Run> {
+        let mut runs: Vec<Run> = Vec::new();
+        if !self.pending.is_empty() {
+            runs.push(Run {
+                speaker: self.pending_speaker.clone(),
+                text: self.pending.clone(),
             });
         }
 
+        let mut speaker = self.pending_speaker.clone();
+        for token in response
+            .tokens
+            .iter()
+            .filter(|t| !t.is_final && !t.is_special())
+        {
+            // A null speaker INHERITS, here as in the durable lane: undiarized
+            // tokens are common and clearing would fragment every turn.
+            if let Some(found) = token.normalized_speaker() {
+                speaker = Some(found);
+            }
+            match runs.last_mut() {
+                Some(last) if last.speaker == speaker => last.text.push_str(&token.text),
+                _ => runs.push(Run {
+                    speaker: speaker.clone(),
+                    text: token.text.clone(),
+                }),
+            }
+        }
+
+        runs.retain(|run| !run.text.trim().is_empty());
+        runs
+    }
+
+    /// Emits the open runs against stable ids, retracting any segment that no
+    /// longer has a run behind it.
+    fn publish_open(&mut self, runs: Vec<Run>, ids: &SegmentIds) -> Vec<TranscriptUpdate> {
+        let mut out = Vec::new();
+
+        for (i, run) in runs.iter().enumerate() {
+            let id = match self.open_ids.get(i) {
+                Some(id) => *id,
+                None => {
+                    let id = ids.next();
+                    self.open_ids.push(id);
+                    id
+                }
+            };
+            out.push(TranscriptUpdate {
+                segment_id: id,
+                is_final: false,
+                text: run.text.clone(),
+                speaker: run.speaker.clone().map(SpeakerId),
+            });
+        }
+
+        // Finalizing with empty text is how a provisionally-shown segment is
+        // withdrawn; without this a shrinking tail would strand it on screen
+        // forever, because the store only drops an open id when it finalizes.
+        for id in self.open_ids.split_off(runs.len()) {
+            out.push(TranscriptUpdate {
+                segment_id: id,
+                is_final: true,
+                text: String::new(),
+                speaker: None,
+            });
+        }
+
+        self.open_runs = runs;
         out
     }
 
@@ -148,8 +219,15 @@ impl Accumulator {
             self.pending.clear();
             return;
         }
-        let id = self.open_id.take().unwrap_or_else(|| ids.next());
-        self.open_emitted = false;
+        // Reuse the first open id: that is the segment which has been showing
+        // this text, so it finalizes in place rather than flickering through a
+        // retract-and-replace.
+        let id = if self.open_ids.is_empty() {
+            ids.next()
+        } else {
+            self.open_runs.remove(0);
+            self.open_ids.remove(0)
+        };
         out.push(TranscriptUpdate {
             segment_id: id,
             is_final: true,
@@ -167,29 +245,36 @@ impl Accumulator {
     /// Stop — there is no trailing silence to trigger finalization. Flushing
     /// only the durable lane truncates that utterance mid-sentence.
     pub fn finish(&mut self, ids: &SegmentIds) -> Vec<TranscriptUpdate> {
-        // Nothing further is coming, so the tail stops being provisional.
-        if !self.tail.trim().is_empty() {
-            let tail = std::mem::take(&mut self.tail);
-            self.pending.push_str(&tail);
-        }
-        self.tail.clear();
-
         let mut out = Vec::new();
-        self.flush(&mut out, ids);
-        if out.is_empty() && self.open_emitted {
-            // An open segment was shown but has no durable text behind it;
-            // retract it by finalizing as empty so the UI stops dimming it.
-            if let Some(id) = self.open_id.take() {
-                out.push(TranscriptUpdate {
-                    segment_id: id,
-                    is_final: true,
-                    text: String::new(),
-                    speaker: None,
-                });
-            }
+
+        // `open_runs[0]` already contains `pending`, so finalizing the runs
+        // covers the durable text too — flushing separately would emit it
+        // twice.
+        let runs = std::mem::take(&mut self.open_runs);
+        let open_ids = std::mem::take(&mut self.open_ids);
+
+        for (i, run) in runs.iter().enumerate() {
+            let id = open_ids.get(i).copied().unwrap_or_else(|| ids.next());
+            out.push(TranscriptUpdate {
+                segment_id: id,
+                is_final: true,
+                text: run.text.clone(),
+                speaker: run.speaker.clone().map(SpeakerId),
+            });
         }
-        self.open_id = None;
-        self.open_emitted = false;
+
+        // Anything shown but no longer backed by a run is retracted, so the UI
+        // stops dimming a segment that will never finalize.
+        for id in open_ids.into_iter().skip(runs.len()) {
+            out.push(TranscriptUpdate {
+                segment_id: id,
+                is_final: true,
+                text: String::new(),
+                speaker: None,
+            });
+        }
+
+        self.pending.clear();
         out
     }
 
@@ -197,10 +282,9 @@ impl Accumulator {
     /// already flushed the open segment.
     pub fn reset(&mut self) {
         self.pending.clear();
-        self.tail.clear();
         self.pending_speaker = None;
-        self.open_id = None;
-        self.open_emitted = false;
+        self.open_runs.clear();
+        self.open_ids.clear();
     }
 }
 
@@ -436,19 +520,160 @@ mod tests {
     }
 
     #[test]
-    fn provisional_speaker_mislabel_self_corrects() {
+    fn provisional_speaker_is_shown_and_self_corrects() {
         let ids = SegmentIds::new();
         let mut acc = Accumulator::new();
 
-        // "How" arrives non-final attributed to speaker 2 ...
+        // "How" arrives non-final attributed to speaker 2. That label is shown
+        // immediately: finalization can lag by seconds, and an attributed live
+        // tail is worth more than a correct one that arrives late.
         let a = acc.ingest(&response(vec![token("How", false, Some("2"))]), &ids);
-        assert!(a[0].speaker.is_none(), "no durable speaker yet");
+        assert_eq!(a[0].speaker.as_ref().unwrap().0, "2");
 
         // ... then finalizes as speaker 1. The volatile lane is rebuilt each
         // message, so the mislabel never becomes durable.
         acc.ingest(&response(vec![token("How", true, Some("1"))]), &ids);
         let finals = acc.finish(&ids);
         assert_eq!(finals[0].speaker.as_ref().unwrap().0, "1");
+    }
+
+    #[test]
+    fn a_provisional_tail_spanning_a_turn_splits_by_speaker() {
+        let ids = SegmentIds::new();
+        let mut acc = Accumulator::new();
+
+        let out = acc.ingest(
+            &response(vec![
+                token("Sounds good", false, Some("1")),
+                token(" Thanks for that", false, Some("2")),
+            ]),
+            &ids,
+        );
+
+        // Two open segments, so the UI can break the line and label each side.
+        assert_eq!(out.len(), 2);
+        assert!(out.iter().all(|u| !u.is_final));
+        assert_eq!(out[0].text, "Sounds good");
+        assert_eq!(out[0].speaker.as_ref().unwrap().0, "1");
+        assert_eq!(out[1].text, " Thanks for that");
+        assert_eq!(out[1].speaker.as_ref().unwrap().0, "2");
+        assert_ne!(out[0].segment_id, out[1].segment_id);
+    }
+
+    #[test]
+    fn open_segment_ids_stay_stable_while_the_run_shape_does() {
+        let ids = SegmentIds::new();
+        let mut acc = Accumulator::new();
+
+        let a = acc.ingest(
+            &response(vec![
+                token("Sounds", false, Some("1")),
+                token(" Thanks", false, Some("2")),
+            ]),
+            &ids,
+        );
+        let b = acc.ingest(
+            &response(vec![
+                token("Sounds good", false, Some("1")),
+                token(" Thanks for that", false, Some("2")),
+            ]),
+            &ids,
+        );
+
+        // Revised in place rather than retracted and re-created, or the UI
+        // would churn a DOM node per response.
+        assert_eq!(a[0].segment_id, b[0].segment_id);
+        assert_eq!(a[1].segment_id, b[1].segment_id);
+    }
+
+    #[test]
+    fn a_shrinking_tail_retracts_the_segment_it_leaves_behind() {
+        let ids = SegmentIds::new();
+        let mut acc = Accumulator::new();
+
+        let a = acc.ingest(
+            &response(vec![
+                token("Sounds good", false, Some("1")),
+                token(" Thanks", false, Some("2")),
+            ]),
+            &ids,
+        );
+        let second_id = a[1].segment_id;
+
+        // The second speaker's provisional text disappears on revision.
+        let b = acc.ingest(
+            &response(vec![token("Sounds good", false, Some("1"))]),
+            &ids,
+        );
+
+        // Without the retraction it would sit on screen forever: the store only
+        // drops an open id when it finalizes.
+        let retraction = b
+            .iter()
+            .find(|u| u.segment_id == second_id)
+            .expect("the stranded segment is retracted");
+        assert!(retraction.is_final);
+        assert_eq!(retraction.text, "");
+    }
+
+    #[test]
+    fn an_undiarized_provisional_token_does_not_start_a_new_run() {
+        let ids = SegmentIds::new();
+        let mut acc = Accumulator::new();
+
+        let out = acc.ingest(
+            &response(vec![
+                token("Sounds", false, Some("1")),
+                token(" good", false, None),
+            ]),
+            &ids,
+        );
+
+        assert_eq!(out.len(), 1, "a null speaker inherits, it does not split");
+        assert_eq!(out[0].text, "Sounds good");
+        assert_eq!(out[0].speaker.as_ref().unwrap().0, "1");
+    }
+
+    #[test]
+    fn finish_finalizes_every_run_of_a_split_tail() {
+        let ids = SegmentIds::new();
+        let mut acc = Accumulator::new();
+
+        acc.ingest(
+            &response(vec![
+                token("Sounds good", false, Some("1")),
+                token(" Thanks for that", false, Some("2")),
+            ]),
+            &ids,
+        );
+        let finals = acc.finish(&ids);
+
+        assert_eq!(finals.len(), 2);
+        assert!(finals.iter().all(|u| u.is_final));
+        assert_eq!(finals[0].text, "Sounds good");
+        assert_eq!(finals[0].speaker.as_ref().unwrap().0, "1");
+        assert_eq!(finals[1].text, " Thanks for that");
+        assert_eq!(finals[1].speaker.as_ref().unwrap().0, "2");
+    }
+
+    #[test]
+    fn durable_text_is_not_emitted_twice_by_finish() {
+        let ids = SegmentIds::new();
+        let mut acc = Accumulator::new();
+
+        // open_runs[0] holds `pending`, so finalizing the runs must not also
+        // flush the durable lane separately.
+        acc.ingest(
+            &response(vec![
+                token("Revenue came in at", true, Some("2")),
+                token(" 3.14 million", false, None),
+            ]),
+            &ids,
+        );
+        let finals = acc.finish(&ids);
+
+        assert_eq!(finals.len(), 1);
+        assert_eq!(finals[0].text, "Revenue came in at 3.14 million");
     }
 
     #[test]
