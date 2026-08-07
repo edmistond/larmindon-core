@@ -12,6 +12,18 @@
 //! Output is written to stdout as `[NN] <text>` lines (one per emission) plus a
 //! `=== TRANSCRIPT ===` block holding the concatenation the UI would build.
 //! Diff those between runs to detect a behaviour change.
+//!
+//! `--provider` selects the ASR backend, which is how the Soniox socket client
+//! is exercised without the GUI — by far the fastest iteration loop for the
+//! protocol, reconnect and shutdown paths:
+//!
+//! ```sh
+//! SONIOX_API_KEY=... cargo run --release --example replay_wav -- fixture.wav --provider soniox
+//! ```
+//!
+//! Keep `--speed 1` for Soniox: a remote service is being fed a live stream, and
+//! anything faster stops resembling one. The default path is unchanged, so the
+//! committed goldens still apply.
 
 use std::env;
 use std::error::Error;
@@ -228,6 +240,12 @@ impl EngineEventSink for CollectSink {
         self.errors.lock().unwrap().push(message);
     }
 
+    /// Reconnects and other recoverable notices. Printed to stderr on purpose:
+    /// stdout is what the goldens diff.
+    fn on_status(&self, level: larmindon_core::StatusLevel, message: String) {
+        eprintln!("[status] {level:?}: {message}");
+    }
+
     fn on_source_switched(&self, _device_id: String) {}
 
     fn on_devices_changed(&self, _devices: Vec<AudioDevice>) {}
@@ -238,7 +256,10 @@ impl EngineEventSink for CollectSink {
 fn main() -> Result<(), Box<dyn Error>> {
     let args: Vec<String> = env::args().skip(1).collect();
     if args.is_empty() || args[0].starts_with("--") {
-        eprintln!("usage: replay_wav <file.wav> [--speed N] [--model PATH] [--diag PATH]");
+        eprintln!(
+            "usage: replay_wav <file.wav> [--speed N] [--model PATH] [--diag PATH] \
+             [--provider nemotron|soniox]"
+        );
         std::process::exit(2);
     }
 
@@ -247,6 +268,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut model_override: Option<String> = None;
     let mut diag_path: Option<String> = None;
     let mut empty_reset: Option<u32> = None;
+    let mut provider: Option<String> = None;
 
     let mut i = 1;
     while i < args.len() {
@@ -261,6 +283,10 @@ fn main() -> Result<(), Box<dyn Error>> {
             }
             "--diag" => {
                 diag_path = Some(args.get(i + 1).ok_or("--diag needs a value")?.clone());
+                i += 2;
+            }
+            "--provider" => {
+                provider = Some(args.get(i + 1).ok_or("--provider needs a value")?.clone());
                 i += 2;
             }
             // Lowering this makes the mid-speech stuck-decoder reset (and its
@@ -290,6 +316,20 @@ fn main() -> Result<(), Box<dyn Error>> {
     // Start from saved settings so the model path matches the real app, then
     // pin everything that affects DSP so runs are comparable.
     let mut settings = Settings::load();
+    if let Some(p) = provider {
+        settings.asr_provider = p;
+    }
+    // Only for the remote provider, so a Nemotron regression run cannot be
+    // perturbed by an unrelated variable being set in the shell.
+    if settings.asr_provider == "soniox" {
+        match env::var("SONIOX_API_KEY") {
+            Ok(key) if !key.trim().is_empty() => settings.soniox_api_key = key,
+            _ if settings.soniox_api_key.is_empty() => {
+                return Err("set SONIOX_API_KEY, or save a key in settings.json".into())
+            }
+            _ => {}
+        }
+    }
     if let Some(m) = model_override {
         settings.model_path = m;
     }
@@ -329,19 +369,25 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     // Warm-up pass: loads the model into the engine's cache while the feeder is
     // gated off. Without this, a cold load overflows the capture buffer.
-    eprintln!("[replay] warm-up pass (loading model)...");
-    cmd_tx.send(Command::Start {
-        device_id: Some("fake".to_string()),
-        settings: settings.clone(),
-    })?;
-    while !done.load(Ordering::Relaxed) {
-        thread::sleep(Duration::from_millis(50));
+    //
+    // Only the on-device backend has anything to warm: a remote one has no
+    // model load to hide, is not cacheable, and would spend a whole connection
+    // on the pass.
+    if settings.asr_provider == "nemotron" {
+        eprintln!("[replay] warm-up pass (loading model)...");
+        cmd_tx.send(Command::Start {
+            device_id: Some("fake".to_string()),
+            settings: settings.clone(),
+        })?;
+        while !done.load(Ordering::Relaxed) {
+            thread::sleep(Duration::from_millis(50));
+        }
+        cmd_tx.send(Command::Stop)?;
+        done.store(false, Ordering::Relaxed);
     }
-    cmd_tx.send(Command::Stop)?;
 
-    // Real pass: model comes from cache, so capture starts being consumed
+    // Real pass: the model comes from cache, so capture starts being consumed
     // immediately and no samples are dropped.
-    done.store(false, Ordering::Relaxed);
     release.store(true, Ordering::Relaxed);
     eprintln!("[replay] replaying...");
     cmd_tx.send(Command::Start {

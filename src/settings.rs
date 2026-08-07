@@ -4,6 +4,11 @@ use std::path::PathBuf;
 
 const VALID_CHUNK_MS: &[usize] = &[80, 160, 560, 1120];
 const VALID_THEMES: &[&str] = &["light", "dark", "system"];
+/// Feature-gated so a build without the Soniox client cannot be configured into
+/// a provider that `create_backend` would then reject at Start.
+#[cfg(feature = "asr-soniox")]
+pub const VALID_ASR_PROVIDERS: &[&str] = &["nemotron", "soniox"];
+#[cfg(not(feature = "asr-soniox"))]
 pub const VALID_ASR_PROVIDERS: &[&str] = &["nemotron"];
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -616,14 +621,36 @@ mod tests {
         assert!(s.has_soniox_api_key());
     }
 
+    #[cfg(feature = "asr-soniox")]
     #[test]
-    fn soniox_is_not_selectable_until_its_client_is_wired_up() {
-        // The key-required rule below it is therefore unreachable for now; it
-        // becomes live the moment "soniox" joins VALID_ASR_PROVIDERS.
+    fn soniox_is_selectable_once_a_key_is_stored() {
         let mut s = Settings::default();
         s.asr_provider = "soniox".to_string();
         s.soniox_api_key = "k".to_string();
-        let err = s.validate().expect_err("soniox not yet a valid provider");
+        assert!(s.validate().is_ok());
+    }
+
+    #[cfg(feature = "asr-soniox")]
+    #[test]
+    fn soniox_without_a_key_is_rejected() {
+        // Selecting the provider with no key would otherwise fail at Start,
+        // well after the point where the user could tell why.
+        let mut s = Settings::default();
+        s.asr_provider = "soniox".to_string();
+        let err = s.validate().expect_err("a key is required");
+        assert!(err.contains("API key"));
+
+        s.soniox_api_key = "   ".to_string();
+        assert!(s.validate().is_err(), "whitespace is not a key");
+    }
+
+    #[cfg(not(feature = "asr-soniox"))]
+    #[test]
+    fn soniox_is_not_selectable_without_its_feature() {
+        let mut s = Settings::default();
+        s.asr_provider = "soniox".to_string();
+        s.soniox_api_key = "k".to_string();
+        let err = s.validate().expect_err("soniox is not compiled in");
         assert!(err.contains("Invalid asr_provider"));
     }
 

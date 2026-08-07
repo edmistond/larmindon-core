@@ -249,6 +249,8 @@ pub fn create_backend(
 
     match settings.asr_provider.as_str() {
         "nemotron" => Ok(reusable.unwrap_or_else(|| Box::new(nemotron::NemotronBackend::new()))),
+        #[cfg(feature = "asr-soniox")]
+        "soniox" => Ok(Box::new(soniox::SonioxBackend::new())),
         other => Err(AsrError::Fatal(format!(
             "Unknown transcription provider '{other}'"
         ))),
