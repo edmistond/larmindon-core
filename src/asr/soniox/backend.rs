@@ -115,12 +115,17 @@ impl SonioxBackend {
     /// where capture drained empty.
     fn results(&mut self, ids: &SegmentIds) -> Result<Vec<TranscriptUpdate>, AsrError> {
         let updates = self.drain_inbound(ids);
-        self.deliver(updates)
+        self.deliver(updates, None)
     }
 
+    /// `fallback` is used only when the socket thread reported nothing better.
+    /// A send failure means the thread has gone, and the reason it went is
+    /// almost always already queued and far more useful than "the channel is
+    /// closed" — a rejected API key being the obvious case.
     fn deliver(
         &mut self,
         updates: Vec<TranscriptUpdate>,
+        fallback: Option<AsrError>,
     ) -> Result<Vec<TranscriptUpdate>, AsrError> {
         if !updates.is_empty() {
             return Ok(updates);
@@ -130,6 +135,9 @@ impl SonioxBackend {
         }
         if let Some(message) = self.pending_transient.take() {
             return Err(AsrError::Transient(message));
+        }
+        if let Some(error) = fallback {
+            return Err(error);
         }
         Ok(updates)
     }
@@ -197,6 +205,8 @@ impl AsrBackend for SonioxBackend {
     }
 
     fn process(&mut self, ctx: &AsrContext) -> Result<Vec<TranscriptUpdate>, AsrError> {
+        let mut send_error = None;
+
         if !self.staged.is_empty() {
             let pcm = std::mem::take(&mut self.staged);
             let samples = std::mem::replace(&mut self.staged_samples, 0);
@@ -209,11 +219,18 @@ impl AsrBackend for SonioxBackend {
 
             // On backpressure the staged buffer is already gone, which is
             // exactly the relief the ceiling is there to provide.
-            client.send_audio(pcm, samples)?;
-            self.frames_sent += 1;
+            match client.send_audio(pcm, samples) {
+                Ok(()) => self.frames_sent += 1,
+                // Deliberately not `?`. Returning here would skip the drain
+                // below, and a send failure means the socket thread has already
+                // exited — leaving the reason it exited unread. That reason is
+                // the one worth showing.
+                Err(e) => send_error = Some(e),
+            }
         }
 
-        self.results(ctx.session.ids)
+        let updates = self.drain_inbound(ctx.session.ids);
+        self.deliver(updates, send_error)
     }
 
     fn poll(&mut self, ctx: &SessionContext) -> Result<Vec<TranscriptUpdate>, AsrError> {
@@ -411,7 +428,9 @@ mod tests {
         );
         assert!(!updates.is_empty());
 
-        let delivered = backend.deliver(updates).expect("text is delivered first");
+        let delivered = backend
+            .deliver(updates, None)
+            .expect("text is delivered first");
         assert_eq!(delivered.len(), 1);
         assert!(
             backend.pending_transient.is_some(),
@@ -419,7 +438,7 @@ mod tests {
         );
 
         // With no text left to deliver, the status surfaces.
-        match backend.deliver(Vec::new()) {
+        match backend.deliver(Vec::new(), None) {
             Err(AsrError::Transient(message)) => assert!(message.contains("Reconnecting")),
             other => panic!("expected the owed transient status, got {other:?}"),
         }
@@ -444,17 +463,56 @@ mod tests {
 
         // The engine discards whatever end_session returns on the fatal path,
         // so this flush is the only thing keeping that text.
-        let delivered = backend.deliver(updates).expect("text first");
+        let delivered = backend.deliver(updates, None).expect("text first");
         assert!(delivered
             .iter()
             .any(|u| u.is_final && u.text == "Recognized before the failure"));
 
-        match backend.deliver(Vec::new()) {
+        match backend.deliver(Vec::new(), None) {
             Err(AsrError::Fatal(message)) => assert!(message.contains("rejected")),
             other => panic!("expected a fatal, got {other:?}"),
         }
         // Taken, not repeated.
-        assert!(backend.deliver(Vec::new()).is_ok());
+        assert!(backend.deliver(Vec::new(), None).is_ok());
+    }
+
+    #[test]
+    fn the_socket_threads_reason_beats_the_send_failure_it_caused() {
+        // Regression: a rejected API key made the socket thread exit, which made
+        // the next send fail, and `?` on that send returned "the connection has
+        // ended" without ever draining the real reason. An invalid key is the
+        // likeliest first-run failure, so it is the one that has to read well.
+        let ids = SegmentIds::new();
+        let mut backend = SonioxBackend::new();
+        backend.fold(
+            vec![Inbound::Fatal(
+                "Soniox rejected the session: bad key (unauthenticated)".to_string(),
+            )],
+            &ids,
+        );
+
+        let generic = Some(AsrError::Fatal(
+            "The Soniox connection has ended".to_string(),
+        ));
+        match backend.deliver(Vec::new(), generic) {
+            Err(AsrError::Fatal(message)) => assert!(
+                message.contains("unauthenticated"),
+                "expected the socket thread's reason, got {message:?}"
+            ),
+            other => panic!("expected a fatal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_send_failure_is_still_reported_when_nothing_better_exists() {
+        let mut backend = SonioxBackend::new();
+        let generic = Some(AsrError::Fatal(
+            "The Soniox connection has ended".to_string(),
+        ));
+        match backend.deliver(Vec::new(), generic) {
+            Err(AsrError::Fatal(message)) => assert!(message.contains("connection has ended")),
+            other => panic!("expected the fallback fatal, got {other:?}"),
+        }
     }
 
     #[test]
