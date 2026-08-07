@@ -120,7 +120,14 @@ impl Default for Settings {
             soniox_model: "stt-rt-v5".to_string(),
             soniox_language_hints: "en".to_string(),
             soniox_diarization: true,
-            soniox_endpoint_detection: true,
+            // Off by default. Measured on the two-speaker fixture: with it on,
+            // diarization invented a third speaker and stopped tracking turns
+            // at all (10/10 turns correct off, essentially random on), and
+            // sentences over-split — 30 segments against 26. Soniox's own docs
+            // say it finalizes earlier at the cost of WER and diarization
+            // accuracy, and the known-working reference client also sets it
+            // false and segments client-side on punctuation.
+            soniox_endpoint_detection: false,
         }
     }
 }
