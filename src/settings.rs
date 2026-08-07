@@ -437,8 +437,10 @@ mod tests {
 
     #[test]
     fn validate_rejects_invalid_chunk_ms() {
-        let mut s = Settings::default();
-        s.chunk_ms = 999;
+        let s = Settings {
+            chunk_ms: 999,
+            ..Default::default()
+        };
         assert!(s.validate().is_err());
         assert!(s.validate().unwrap_err().contains("chunk_ms"));
     }
@@ -446,48 +448,60 @@ mod tests {
     #[test]
     fn validate_accepts_all_valid_chunk_ms() {
         for &ms in &[80, 160, 560, 1120] {
-            let mut s = Settings::default();
-            s.chunk_ms = ms;
+            let s = Settings {
+                chunk_ms: ms,
+                ..Default::default()
+            };
             assert!(s.validate().is_ok(), "chunk_ms={} should be valid", ms);
         }
     }
 
     #[test]
     fn validate_rejects_zero_intra_threads() {
-        let mut s = Settings::default();
-        s.intra_threads = 0;
+        let s = Settings {
+            intra_threads: 0,
+            ..Default::default()
+        };
         assert!(s.validate().is_err());
         assert!(s.validate().unwrap_err().contains("intra_threads"));
     }
 
     #[test]
     fn validate_rejects_zero_inter_threads() {
-        let mut s = Settings::default();
-        s.inter_threads = 0;
+        let s = Settings {
+            inter_threads: 0,
+            ..Default::default()
+        };
         assert!(s.validate().is_err());
         assert!(s.validate().unwrap_err().contains("inter_threads"));
     }
 
     #[test]
     fn validate_rejects_zero_empty_reset_threshold() {
-        let mut s = Settings::default();
-        s.empty_reset_threshold = 0;
+        let s = Settings {
+            empty_reset_threshold: 0,
+            ..Default::default()
+        };
         assert!(s.validate().is_err());
         assert!(s.validate().unwrap_err().contains("empty_reset_threshold"));
     }
 
     #[test]
     fn validate_rejects_empty_model_path() {
-        let mut s = Settings::default();
-        s.model_path = "   ".to_string();
+        let s = Settings {
+            model_path: "   ".to_string(),
+            ..Default::default()
+        };
         assert!(s.validate().is_err());
         assert!(s.validate().unwrap_err().contains("model_path"));
     }
 
     #[test]
     fn validate_rejects_invalid_theme_mode() {
-        let mut s = Settings::default();
-        s.theme_mode = "neon".to_string();
+        let s = Settings {
+            theme_mode: "neon".to_string(),
+            ..Default::default()
+        };
         assert!(s.validate().is_err());
         assert!(s.validate().unwrap_err().contains("theme_mode"));
     }
@@ -495,37 +509,47 @@ mod tests {
     #[test]
     fn validate_accepts_all_valid_themes() {
         for theme in &["light", "dark", "system"] {
-            let mut s = Settings::default();
-            s.theme_mode = theme.to_string();
+            let s = Settings {
+                theme_mode: theme.to_string(),
+                ..Default::default()
+            };
             assert!(s.validate().is_ok(), "theme '{}' should be valid", theme);
         }
     }
 
     #[test]
     fn validate_rejects_vad_threshold_out_of_range() {
-        let mut s = Settings::default();
-        s.vad_threshold_start = 1.5;
+        let s = Settings {
+            vad_threshold_start: 1.5,
+            ..Default::default()
+        };
         assert!(s.validate().is_err());
 
-        let mut s = Settings::default();
-        s.vad_threshold_end = -0.1;
+        let s = Settings {
+            vad_threshold_end: -0.1,
+            ..Default::default()
+        };
         assert!(s.validate().is_err());
     }
 
     #[test]
     fn validate_rejects_start_below_end_threshold() {
-        let mut s = Settings::default();
-        s.vad_threshold_start = 0.2;
-        s.vad_threshold_end = 0.5;
+        let s = Settings {
+            vad_threshold_start: 0.2,
+            vad_threshold_end: 0.5,
+            ..Default::default()
+        };
         assert!(s.validate().is_err());
         assert!(s.validate().unwrap_err().contains("vad_threshold_start"));
     }
 
     #[test]
     fn validate_accepts_equal_thresholds() {
-        let mut s = Settings::default();
-        s.vad_threshold_start = 0.5;
-        s.vad_threshold_end = 0.5;
+        let s = Settings {
+            vad_threshold_start: 0.5,
+            vad_threshold_end: 0.5,
+            ..Default::default()
+        };
         assert!(s.validate().is_ok());
     }
 
@@ -574,15 +598,17 @@ mod tests {
         assert_eq!(settings.chunk_ms, 160);
         // All other fields should be defaults
         assert_eq!(settings.intra_threads, 2);
-        assert_eq!(settings.punctuation_reset, true);
+        assert!(settings.punctuation_reset);
     }
 
     #[test]
     fn redacted_blanks_the_api_key_and_keeps_everything_else() {
-        let mut s = Settings::default();
-        s.soniox_api_key = "super-secret".to_string();
-        s.soniox_model = "stt-rt-v5".to_string();
-        s.font_family = "Victor Mono".to_string();
+        let s = Settings {
+            soniox_api_key: "super-secret".to_string(),
+            soniox_model: "stt-rt-v5".to_string(),
+            font_family: "Victor Mono".to_string(),
+            ..Default::default()
+        };
 
         let r = s.redacted();
 
@@ -595,16 +621,20 @@ mod tests {
 
     #[test]
     fn redacted_output_does_not_serialize_the_key() {
-        let mut s = Settings::default();
-        s.soniox_api_key = "super-secret".to_string();
+        let s = Settings {
+            soniox_api_key: "super-secret".to_string(),
+            ..Default::default()
+        };
         let json = serde_json::to_string(&s.redacted()).unwrap();
         assert!(!json.contains("super-secret"));
     }
 
     #[test]
     fn debug_never_prints_the_api_key() {
-        let mut s = Settings::default();
-        s.soniox_api_key = "super-secret".to_string();
+        let s = Settings {
+            soniox_api_key: "super-secret".to_string(),
+            ..Default::default()
+        };
         let printed = format!("{s:?}");
         assert!(!printed.contains("super-secret"));
         assert!(printed.contains("<redacted>"));
@@ -624,9 +654,11 @@ mod tests {
     #[cfg(feature = "asr-soniox")]
     #[test]
     fn soniox_is_selectable_once_a_key_is_stored() {
-        let mut s = Settings::default();
-        s.asr_provider = "soniox".to_string();
-        s.soniox_api_key = "k".to_string();
+        let s = Settings {
+            asr_provider: "soniox".to_string(),
+            soniox_api_key: "k".to_string(),
+            ..Default::default()
+        };
         assert!(s.validate().is_ok());
     }
 
@@ -635,8 +667,10 @@ mod tests {
     fn soniox_without_a_key_is_rejected() {
         // Selecting the provider with no key would otherwise fail at Start,
         // well after the point where the user could tell why.
-        let mut s = Settings::default();
-        s.asr_provider = "soniox".to_string();
+        let mut s = Settings {
+            asr_provider: "soniox".to_string(),
+            ..Default::default()
+        };
         let err = s.validate().expect_err("a key is required");
         assert!(err.contains("API key"));
 
@@ -647,17 +681,21 @@ mod tests {
     #[cfg(not(feature = "asr-soniox"))]
     #[test]
     fn soniox_is_not_selectable_without_its_feature() {
-        let mut s = Settings::default();
-        s.asr_provider = "soniox".to_string();
-        s.soniox_api_key = "k".to_string();
+        let s = Settings {
+            asr_provider: "soniox".to_string(),
+            soniox_api_key: "k".to_string(),
+            ..Default::default()
+        };
         let err = s.validate().expect_err("soniox is not compiled in");
         assert!(err.contains("Invalid asr_provider"));
     }
 
     #[test]
     fn unknown_provider_is_rejected() {
-        let mut s = Settings::default();
-        s.asr_provider = "not-a-provider".to_string();
+        let s = Settings {
+            asr_provider: "not-a-provider".to_string(),
+            ..Default::default()
+        };
         assert!(s.validate().is_err());
     }
 

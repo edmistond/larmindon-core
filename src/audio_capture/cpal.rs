@@ -237,38 +237,6 @@ impl AudioStream for CpalStream {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn cpal_device_ids_include_device_direction() {
-        let raw_name = "L-Phonak hearing aid";
-
-        assert_eq!(
-            cpal_device_id(DeviceType::Input, raw_name),
-            "input:L-Phonak hearing aid"
-        );
-        assert_eq!(
-            cpal_device_id(DeviceType::Monitor, raw_name),
-            "output:L-Phonak hearing aid"
-        );
-    }
-
-    #[test]
-    fn parse_cpal_device_id_preserves_raw_device_name() {
-        assert_eq!(
-            parse_cpal_device_id("input:L-Phonak hearing aid"),
-            Some((DeviceType::Input, "L-Phonak hearing aid"))
-        );
-        assert_eq!(
-            parse_cpal_device_id("output:L-Phonak hearing aid"),
-            Some((DeviceType::Monitor, "L-Phonak hearing aid"))
-        );
-        assert_eq!(parse_cpal_device_id("L-Phonak hearing aid"), None);
-    }
-}
-
 fn build_stream(
     device: &Device,
     config: &StreamConfig,
@@ -360,5 +328,37 @@ fn push_mono_convert<T, F>(
                 guard.push_sample(mono);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cpal_device_ids_include_device_direction() {
+        let raw_name = "L-Phonak hearing aid";
+
+        assert_eq!(
+            cpal_device_id(DeviceType::Input, raw_name),
+            "input:L-Phonak hearing aid"
+        );
+        assert_eq!(
+            cpal_device_id(DeviceType::Monitor, raw_name),
+            "output:L-Phonak hearing aid"
+        );
+    }
+
+    #[test]
+    fn parse_cpal_device_id_preserves_raw_device_name() {
+        assert_eq!(
+            parse_cpal_device_id("input:L-Phonak hearing aid"),
+            Some((DeviceType::Input, "L-Phonak hearing aid"))
+        );
+        assert_eq!(
+            parse_cpal_device_id("output:L-Phonak hearing aid"),
+            Some((DeviceType::Monitor, "L-Phonak hearing aid"))
+        );
+        assert_eq!(parse_cpal_device_id("L-Phonak hearing aid"), None);
     }
 }
