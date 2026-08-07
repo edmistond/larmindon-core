@@ -16,6 +16,26 @@ ort = "2.0.0-rc.12"
 ndarray = "0.17"
 cpal = { version = "0.17", optional = true }
 
+# Soniox cloud backend. native-tls rather than rustls: native-tls is already in
+# this build via ureq <- ort, so it adds no new native build step, and it uses
+# schannel on Windows. A rustls stack would pull in ring or aws-lc-rs, whose
+# NASM/cmake build scripts run through the hand-written MSVC INCLUDE/LIB
+# overrides in .cargo/config.toml.
+tokio = { version = "1", features = [
+    "rt",
+    "net",
+    "time",
+    "sync",
+    "macros",
+], optional = true }
+tokio-tungstenite = { version = "0.28", default-features = false, features = [
+    "connect",
+    "native-tls",
+], optional = true }
+futures-util = { version = "0.3", default-features = false, features = [
+    "sink",
+], optional = true }
+
 [target.'cfg(target_os = "linux")'.dependencies]
 pipewire = { version = "0.9", optional = true }
 libspa = { version = "0.9", optional = true }
@@ -36,7 +56,8 @@ windows = { version = "0.62", features = [
 ] }
 
 [features]
-default = ["cpal", "pipewire"]
+default = ["cpal", "pipewire", "asr-soniox"]
+asr-soniox = ["dep:tokio", "dep:tokio-tungstenite", "dep:futures-util"]
 webgpu = ["parakeet-rs/webgpu"]
 directml = ["parakeet-rs/directml"]
 migraphx = ["parakeet-rs/migraphx"]

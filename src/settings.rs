@@ -1,12 +1,16 @@
 use serde::{Deserialize, Serialize};
+use std::fmt;
 use std::path::PathBuf;
 
 const VALID_CHUNK_MS: &[usize] = &[80, 160, 560, 1120];
 const VALID_THEMES: &[&str] = &["light", "dark", "system"];
+pub const VALID_ASR_PROVIDERS: &[&str] = &["nemotron"];
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
+    /// Which speech backend to use. See `VALID_ASR_PROVIDERS`.
+    pub asr_provider: String,
     pub model_path: String,
     pub chunk_ms: usize,
     pub intra_threads: usize,
@@ -37,11 +41,58 @@ pub struct Settings {
     pub agc_attack_ms: f32,
     /// AGC release time in ms (slow gain increase when signal gets quiet).
     pub agc_release_ms: f32,
+    /// Soniox API key. Never sent to a webview — see [`Settings::redacted`].
+    pub soniox_api_key: String,
+    pub soniox_model: String,
+    /// Comma-separated language hints, e.g. "en" or "en,es".
+    pub soniox_language_hints: String,
+    pub soniox_diarization: bool,
+    pub soniox_endpoint_detection: bool,
+}
+
+impl fmt::Debug for Settings {
+    /// Hand-written so the API key can never reach a log through `{:?}`.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Settings")
+            .field("asr_provider", &self.asr_provider)
+            .field("model_path", &self.model_path)
+            .field("chunk_ms", &self.chunk_ms)
+            .field("intra_threads", &self.intra_threads)
+            .field("inter_threads", &self.inter_threads)
+            .field("punctuation_reset", &self.punctuation_reset)
+            .field("empty_reset_threshold", &self.empty_reset_threshold)
+            .field("font_family", &self.font_family)
+            .field("font_size_px", &self.font_size_px)
+            .field("theme_mode", &self.theme_mode)
+            .field("vad_threshold_start", &self.vad_threshold_start)
+            .field("vad_threshold_end", &self.vad_threshold_end)
+            .field("diagnostics_enabled", &self.diagnostics_enabled)
+            .field("diagnostics_db_path", &self.diagnostics_db_path)
+            .field("agc_enabled", &self.agc_enabled)
+            .field("agc_target_rms_dbfs", &self.agc_target_rms_dbfs)
+            .field("agc_max_gain_db", &self.agc_max_gain_db)
+            .field("agc_attack_ms", &self.agc_attack_ms)
+            .field("agc_release_ms", &self.agc_release_ms)
+            .field(
+                "soniox_api_key",
+                &if self.soniox_api_key.is_empty() {
+                    "<unset>"
+                } else {
+                    "<redacted>"
+                },
+            )
+            .field("soniox_model", &self.soniox_model)
+            .field("soniox_language_hints", &self.soniox_language_hints)
+            .field("soniox_diarization", &self.soniox_diarization)
+            .field("soniox_endpoint_detection", &self.soniox_endpoint_detection)
+            .finish()
+    }
 }
 
 impl Default for Settings {
     fn default() -> Self {
         Self {
+            asr_provider: "nemotron".to_string(),
             model_path: "~/projects/prs-nemotron/".to_string(),
             chunk_ms: 560,
             intra_threads: 2,
@@ -60,6 +111,11 @@ impl Default for Settings {
             agc_max_gain_db: 30.0,
             agc_attack_ms: 20.0,
             agc_release_ms: 400.0,
+            soniox_api_key: String::new(),
+            soniox_model: "stt-rt-v5".to_string(),
+            soniox_language_hints: "en".to_string(),
+            soniox_diarization: true,
+            soniox_endpoint_detection: true,
         }
     }
 }
@@ -182,11 +238,51 @@ impl Settings {
             }
         }
 
+        if let Ok(val) = std::env::var("SONIOX_API_KEY") {
+            if val.trim().is_empty() {
+                eprintln!("SONIOX_API_KEY is empty, keeping saved value.");
+            } else {
+                // Deliberately does not echo the value.
+                println!("Soniox API key overridden via SONIOX_API_KEY");
+                self.soniox_api_key = val;
+            }
+        }
+
         self
+    }
+
+    /// A copy with every secret blanked, safe to hand to a webview.
+    ///
+    /// The whole struct is broadcast to all windows and mirrored into
+    /// `localStorage`, so redacting at the boundary keeps the key out of every
+    /// one of those by construction rather than by remembering to filter at
+    /// each site.
+    pub fn redacted(&self) -> Self {
+        Self {
+            soniox_api_key: String::new(),
+            ..self.clone()
+        }
+    }
+
+    /// Whether a key is stored, so the UI can distinguish "saved, type to
+    /// replace" from "not set" without ever seeing the value.
+    pub fn has_soniox_api_key(&self) -> bool {
+        !self.soniox_api_key.is_empty()
     }
 
     /// Validate that settings values are within acceptable ranges.
     pub fn validate(&self) -> Result<(), String> {
+        if !VALID_ASR_PROVIDERS.contains(&self.asr_provider.as_str()) {
+            return Err(format!(
+                "Invalid asr_provider '{}'; must be one of {:?}",
+                self.asr_provider, VALID_ASR_PROVIDERS
+            ));
+        }
+        if self.asr_provider == "soniox" && self.soniox_api_key.trim().is_empty() {
+            return Err(
+                "A Soniox API key is required when the Soniox provider is selected".to_string(),
+            );
+        }
         if !VALID_CHUNK_MS.contains(&self.chunk_ms) {
             return Err(format!(
                 "Invalid chunk_ms {}; must be one of {:?}",
@@ -474,5 +570,78 @@ mod tests {
         // All other fields should be defaults
         assert_eq!(settings.intra_threads, 2);
         assert_eq!(settings.punctuation_reset, true);
+    }
+
+    #[test]
+    fn redacted_blanks_the_api_key_and_keeps_everything_else() {
+        let mut s = Settings::default();
+        s.soniox_api_key = "super-secret".to_string();
+        s.soniox_model = "stt-rt-v5".to_string();
+        s.font_family = "Victor Mono".to_string();
+
+        let r = s.redacted();
+
+        assert_eq!(r.soniox_api_key, "");
+        assert_eq!(r.soniox_model, "stt-rt-v5");
+        assert_eq!(r.font_family, "Victor Mono");
+        // The original is untouched.
+        assert_eq!(s.soniox_api_key, "super-secret");
+    }
+
+    #[test]
+    fn redacted_output_does_not_serialize_the_key() {
+        let mut s = Settings::default();
+        s.soniox_api_key = "super-secret".to_string();
+        let json = serde_json::to_string(&s.redacted()).unwrap();
+        assert!(!json.contains("super-secret"));
+    }
+
+    #[test]
+    fn debug_never_prints_the_api_key() {
+        let mut s = Settings::default();
+        s.soniox_api_key = "super-secret".to_string();
+        let printed = format!("{s:?}");
+        assert!(!printed.contains("super-secret"));
+        assert!(printed.contains("<redacted>"));
+
+        let empty = Settings::default();
+        assert!(format!("{empty:?}").contains("<unset>"));
+    }
+
+    #[test]
+    fn has_soniox_api_key_reports_presence_only() {
+        let mut s = Settings::default();
+        assert!(!s.has_soniox_api_key());
+        s.soniox_api_key = "k".to_string();
+        assert!(s.has_soniox_api_key());
+    }
+
+    #[test]
+    fn soniox_is_not_selectable_until_its_client_is_wired_up() {
+        // The key-required rule below it is therefore unreachable for now; it
+        // becomes live the moment "soniox" joins VALID_ASR_PROVIDERS.
+        let mut s = Settings::default();
+        s.asr_provider = "soniox".to_string();
+        s.soniox_api_key = "k".to_string();
+        let err = s.validate().expect_err("soniox not yet a valid provider");
+        assert!(err.contains("Invalid asr_provider"));
+    }
+
+    #[test]
+    fn unknown_provider_is_rejected() {
+        let mut s = Settings::default();
+        s.asr_provider = "not-a-provider".to_string();
+        assert!(s.validate().is_err());
+    }
+
+    #[test]
+    fn existing_config_files_load_without_the_new_fields() {
+        // Files written before the Soniox fields existed must still parse.
+        let json = r#"{"model_path":"/m","chunk_ms":560,"theme_mode":"dark"}"#;
+        let s: Settings = serde_json::from_str(json).unwrap();
+        assert_eq!(s.asr_provider, "nemotron");
+        assert_eq!(s.soniox_model, "stt-rt-v5");
+        assert_eq!(s.soniox_api_key, "");
+        assert!(s.soniox_diarization);
     }
 }
