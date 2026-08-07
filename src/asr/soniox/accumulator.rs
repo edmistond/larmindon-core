@@ -206,9 +206,21 @@ impl Accumulator {
 
 /// Whether `text` ends a sentence.
 ///
-/// A terminator may be followed by closing quotes/brackets, and must be
-/// followed by whitespace or end-of-input. That last rule is what keeps `3.14`
-/// and `e.g.` from splitting mid-token.
+/// A terminator may be followed by closing quotes/brackets. Note that this only
+/// ever sees text *up to* the candidate — there is no lookahead, because tokens
+/// arrive one at a time — so "is the next character whitespace?" is not a
+/// question this can ask. Everything it rejects, it rejects on what precedes
+/// the dot.
+///
+/// Two rejections, both observed rather than imagined:
+///
+/// * a digit before `.` is a decimal (`3.14`);
+/// * a lone letter before `.` is an abbreviation or an initial (`e.g.`, `U.S.`,
+///   `J. R. R.`), never a word ending a sentence.
+///
+/// Known limitation: multi-letter abbreviations (`etc.`, `Mr.`, `vs.`) still
+/// split. Fixing those needs a word list, which is locale-specific and brittle;
+/// the cost here is a spurious segment boundary, not lost text.
 pub fn ends_sentence(text: &str) -> bool {
     let trimmed = text.trim_end();
     let mut chars = trimmed.chars().rev().skip_while(|c| CLOSERS.contains(c));
@@ -218,12 +230,21 @@ pub fn ends_sentence(text: &str) -> bool {
     if !TERMINATORS.contains(&candidate) {
         return false;
     }
-    // A digit immediately before a '.' means a decimal, not a sentence end.
     if candidate == '.' {
-        if let Some(prev) = chars.next() {
-            if prev.is_ascii_digit() {
-                return false;
+        match chars.next() {
+            Some(prev) if prev.is_ascii_digit() => return false,
+            Some(prev) if prev.is_alphabetic() => {
+                // A single letter, i.e. one preceded by a boundary or by
+                // another abbreviation dot. "put." has 'u' before 't', so it
+                // splits; "e." and the 'g' of "e.g." do not.
+                let boundary = chars
+                    .next()
+                    .is_none_or(|before| before.is_whitespace() || before == '.');
+                if boundary {
+                    return false;
+                }
             }
+            _ => {}
         }
     }
     true
@@ -275,6 +296,23 @@ mod tests {
         assert!(ends_sentence("That is all."));
         assert!(ends_sentence("Really?"));
         assert!(ends_sentence("Stop!"));
+    }
+
+    #[test]
+    fn sentence_splitting_keeps_abbreviations_and_initials_intact() {
+        // Observed live: " ... the renewal rate stabilizes, e." finalized as one
+        // segment and "g., whether the enterprise accounts stay put." as the
+        // next, so a segment began mid-word.
+        assert!(!ends_sentence("whether the rate stabilizes, e."));
+        assert!(!ends_sentence("whether the rate stabilizes, e.g."));
+        assert!(!ends_sentence("based in the U."));
+        assert!(!ends_sentence("based in the U.S."));
+        assert!(!ends_sentence("J."));
+        assert!(!ends_sentence("written by J. R. R."));
+        // A real sentence end still splits: 't' is preceded by 'u', not a
+        // boundary.
+        assert!(ends_sentence("whether the accounts stay put."));
+        assert!(ends_sentence("That is all."));
     }
 
     #[test]
