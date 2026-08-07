@@ -1,0 +1,88 @@
+=== EMISSIONS (42) ===
+[000]  The
+[001]  quick brown
+[002]  fox jumps over
+[003]  the laz
+[004] y dog
+[005]  Transcription
+[006]  quality
+[007]  must remain
+[008]  identical
+[009]  after this
+[010]  refactor
+[011]  We
+[012]  are adding
+[013]  a second
+[014]  speech back
+[015]  into the applic
+[016] ation
+[017]  It
+[018]  connects to
+[019]  a remote ser
+[020] ver over
+[021]  a web sock
+[022] et
+[023]  Pi is approxim
+[024] ately three
+[025]  point one
+[026]  four one
+[027]  five n
+[028] ine
+[029]  Does the decod
+[030] er reset
+[031]  correctly
+[032]  at
+[033]  sentence boundaries
+[034]  Yes
+[035] , it should
+[036]  The
+[037]  audio level
+[038]  meter
+[039]  turns col
+[040] ored when speech
+[041]  is detect
+=== TRANSCRIPT ===
+ The quick brown fox jumps over the lazy dog Transcription quality must remain identical after this refactor We are adding a second speech back into the application It connects to a remote server over a web socket Pi is approximately three point one four one five nine Does the decoder reset correctly at sentence boundaries Yes, it should The audio level meter turns colored when speech is detect
+=== SEGMENTS (42) ===
+id=1 final=true speaker=- text=" The"
+id=2 final=true speaker=- text=" quick brown"
+id=3 final=true speaker=- text=" fox jumps over"
+id=4 final=true speaker=- text=" the laz"
+id=5 final=true speaker=- text="y dog"
+id=6 final=true speaker=- text=" Transcription"
+id=7 final=true speaker=- text=" quality"
+id=8 final=true speaker=- text=" must remain"
+id=9 final=true speaker=- text=" identical"
+id=10 final=true speaker=- text=" after this"
+id=11 final=true speaker=- text=" refactor"
+id=12 final=true speaker=- text=" We"
+id=13 final=true speaker=- text=" are adding"
+id=14 final=true speaker=- text=" a second"
+id=15 final=true speaker=- text=" speech back"
+id=16 final=true speaker=- text=" into the applic"
+id=17 final=true speaker=- text="ation"
+id=18 final=true speaker=- text=" It"
+id=19 final=true speaker=- text=" connects to"
+id=20 final=true speaker=- text=" a remote ser"
+id=21 final=true speaker=- text="ver over"
+id=22 final=true speaker=- text=" a web sock"
+id=23 final=true speaker=- text="et"
+id=24 final=true speaker=- text=" Pi is approxim"
+id=25 final=true speaker=- text="ately three"
+id=26 final=true speaker=- text=" point one"
+id=27 final=true speaker=- text=" four one"
+id=28 final=true speaker=- text=" five n"
+id=29 final=true speaker=- text="ine"
+id=30 final=true speaker=- text=" Does the decod"
+id=31 final=true speaker=- text="er reset"
+id=32 final=true speaker=- text=" correctly"
+id=33 final=true speaker=- text=" at"
+id=34 final=true speaker=- text=" sentence boundaries"
+id=35 final=true speaker=- text=" Yes"
+id=36 final=true speaker=- text=", it should"
+id=37 final=true speaker=- text=" The"
+id=38 final=true speaker=- text=" audio level"
+id=39 final=true speaker=- text=" meter"
+id=40 final=true speaker=- text=" turns col"
+id=41 final=true speaker=- text="ored when speech"
+id=42 final=true speaker=- text=" is detect"

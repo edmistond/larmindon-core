@@ -1,1 +1,4 @@
 * text=auto eol=lf
+
+# Audio fixtures must never go through eol conversion.
+*.wav binary
