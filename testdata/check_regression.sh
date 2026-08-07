@@ -25,7 +25,14 @@ trap 'rm -rf "$work"' EXIT
 cd "$crate" || exit 1
 
 fail=0
-run() { cargo run --release --quiet --example replay_wav -- "$@" 2>/dev/null; }
+# --provider is pinned, not inherited. The harness starts from your saved
+# settings, so without this the gate silently runs whatever asr_provider
+# happens to be set to — and diffs Nemotron goldens against another backend's
+# output. That is a confusing failure precisely when you are least expecting it.
+run() {
+  cargo run --release --quiet --example replay_wav -- \
+    "$@" --provider nemotron 2>/dev/null
+}
 # Goldens start at the EMISSIONS banner; earlier lines are machine-specific
 # stdout (settings path, model path).
 emissions() { sed -n '/=== EMISSIONS/,$p' "$1"; }

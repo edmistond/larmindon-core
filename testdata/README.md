@@ -118,7 +118,15 @@ cargo run --release --example replay_wav -- testdata/baseline_speech.wav \
 python testdata/dump_diag.py /tmp/r.sqlite > testdata/golden_reset_diag.txt
 ```
 
-## A trap worth knowing
+## Two traps worth knowing
+
+`check_regression.sh` pins `--provider nemotron`. The harness otherwise starts
+from your saved settings, so once `asr_provider` is set to anything else — which
+it will be, the moment you use the app with a cloud backend — the gate silently
+runs that backend and diffs its output against Nemotron goldens. The failure
+looks like a catastrophic transcript regression (254 emissions against 88) and
+is nothing of the sort. Do not remove that flag.
+
 
 `replay_wav` runs a warm-up session with its audio feeder gated off, purely to
 populate the engine's model cache. Without it, a cold load of the ~2.4 GB
