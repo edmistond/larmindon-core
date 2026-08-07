@@ -27,6 +27,13 @@ const NO_SPACE_BEFORE: [char; 11] = ['.', ',', '!', '?', ';', ':', ')', ']', '}'
 pub struct Accumulator {
     /// Finalized text not yet flushed into a segment.
     pending: String,
+    /// The latest provisional tail, replaced wholesale by every response.
+    ///
+    /// Retained rather than computed and dropped, because at teardown or before
+    /// a reconnect it is the best text the open segment will ever have — no
+    /// further revision is coming. Dropping it truncates the last utterance,
+    /// which is exactly what a speaker notices.
+    tail: String,
     /// Speaker of the pending text. Only ever set from final tokens.
     pending_speaker: Option<String>,
     /// Id of the currently open (non-final) segment, allocated lazily.
@@ -45,6 +52,7 @@ impl Accumulator {
     pub fn new() -> Self {
         Self {
             pending: String::new(),
+            tail: String::new(),
             pending_speaker: None,
             open_id: None,
             open_emitted: false,
@@ -95,15 +103,17 @@ impl Accumulator {
         }
 
         // Volatile lane: rebuild from the unflushed durable text plus this
-        // message's provisional tail.
-        let tail: String = response
+        // message's provisional tail. The tail replaces its predecessor
+        // wholesale — it is the complete hypothesis as of this response, not a
+        // delta — so there is no prefix-diffing to do.
+        self.tail = response
             .tokens
             .iter()
             .filter(|t| !t.is_final && !t.is_special())
             .map(|t| t.text.as_str())
             .collect();
 
-        let open_text = format!("{}{}", self.pending, tail);
+        let open_text = format!("{}{}", self.pending, self.tail);
         if open_text.trim().is_empty() {
             // Nothing provisional left; drop any open segment by finalizing it
             // as empty is not allowed, so simply forget the id.
@@ -150,7 +160,20 @@ impl Accumulator {
 
     /// Finalizes whatever is open. Used on clean shutdown and before a
     /// reconnect, where the current hypothesis is the best text available.
+    ///
+    /// Promoting the provisional tail is the whole point. The service only
+    /// finalizes tokens once it is confident, which in practice means the last
+    /// utterance of a session is often still provisional when the user presses
+    /// Stop — there is no trailing silence to trigger finalization. Flushing
+    /// only the durable lane truncates that utterance mid-sentence.
     pub fn finish(&mut self, ids: &SegmentIds) -> Vec<TranscriptUpdate> {
+        // Nothing further is coming, so the tail stops being provisional.
+        if !self.tail.trim().is_empty() {
+            let tail = std::mem::take(&mut self.tail);
+            self.pending.push_str(&tail);
+        }
+        self.tail.clear();
+
         let mut out = Vec::new();
         self.flush(&mut out, ids);
         if out.is_empty() && self.open_emitted {
@@ -174,6 +197,7 @@ impl Accumulator {
     /// already flushed the open segment.
     pub fn reset(&mut self) {
         self.pending.clear();
+        self.tail.clear();
         self.pending_speaker = None;
         self.open_id = None;
         self.open_emitted = false;
@@ -387,6 +411,80 @@ mod tests {
         acc.ingest(&response(vec![token("How", true, Some("1"))]), &ids);
         let finals = acc.finish(&ids);
         assert_eq!(finals[0].speaker.as_ref().unwrap().0, "1");
+    }
+
+    #[test]
+    fn finish_promotes_the_provisional_tail_instead_of_truncating() {
+        // Observed live: a session's last utterance is usually still
+        // provisional at Stop, because there is no trailing silence to make the
+        // service finalize it. Flushing only the durable lane produced
+        // "Revenue came in at" and threw away "3.14 million, which is about 4%
+        // under plan."
+        let ids = SegmentIds::new();
+        let mut acc = Accumulator::new();
+
+        acc.ingest(
+            &response(vec![
+                token("Revenue came in at", true, Some("2")),
+                token(" 3.14 million, which is about 4% under plan.", false, None),
+            ]),
+            &ids,
+        );
+
+        let finals = acc.finish(&ids);
+        assert_eq!(finals.len(), 1);
+        assert!(finals[0].is_final);
+        assert_eq!(
+            finals[0].text,
+            "Revenue came in at 3.14 million, which is about 4% under plan."
+        );
+    }
+
+    #[test]
+    fn finish_promotes_a_tail_with_no_durable_text_behind_it() {
+        let ids = SegmentIds::new();
+        let mut acc = Accumulator::new();
+
+        acc.ingest(
+            &response(vec![token("Nothing final yet", false, None)]),
+            &ids,
+        );
+
+        let finals = acc.finish(&ids);
+        assert_eq!(finals.len(), 1);
+        assert_eq!(finals[0].text, "Nothing final yet");
+        assert!(finals[0].is_final);
+    }
+
+    #[test]
+    fn a_stale_tail_does_not_survive_into_the_next_segment() {
+        // The tail is replaced wholesale by every response, so a flush must not
+        // leave the previous hypothesis behind to be promoted later.
+        let ids = SegmentIds::new();
+        let mut acc = Accumulator::new();
+
+        acc.ingest(&response(vec![token("First guess", false, None)]), &ids);
+        // The guess finalizes and the sentence closes; no tail remains.
+        acc.ingest(&response(vec![token("First guess.", true, None)]), &ids);
+
+        let finals = acc.finish(&ids);
+        assert!(
+            finals.is_empty(),
+            "nothing should remain after a clean flush, got {finals:?}"
+        );
+    }
+
+    #[test]
+    fn reset_discards_the_tail_so_a_reconnect_does_not_replay_it() {
+        let ids = SegmentIds::new();
+        let mut acc = Accumulator::new();
+
+        acc.ingest(&response(vec![token("half a thought", false, None)]), &ids);
+        // A reconnect flushes first, then resets.
+        let _ = acc.finish(&ids);
+        acc.reset();
+
+        assert!(acc.finish(&ids).is_empty());
     }
 
     #[test]
