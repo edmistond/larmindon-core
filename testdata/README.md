@@ -19,6 +19,58 @@ bash testdata/check_regression.sh
 | `golden_reset_diag.txt` | Drain-invariant diagnostics rows for that run |
 | `dump_diag.py` | Normalizes a diagnostics DB for diffing |
 | `check_regression.sh` | Runs both fixtures and diffs all three goldens |
+| `two_speaker.wav` | 75 s, 10 alternating turns across two voices, for the Soniox diarization check |
+| `two_speaker_short.wav` | 29 s, first 4 turns of the same script, for fast iteration |
+| `make_two_speaker.ps1` | Regenerates both. Windows-only; see below |
+
+## The two-speaker fixtures
+
+These exercise the Soniox path. No golden is attached to either — a cloud
+model's output is not reproducible — so they are **not** part of
+`check_regression.sh`.
+
+Both use SSML voice switching, so the two speakers share one continuous stream
+rather than being concatenated files. Turn boundaries then look like a
+conversation to the diarizer rather than like hard cuts.
+
+```sh
+SONIOX_API_KEY=... cargo run --release --example replay_wav -- \
+  testdata/two_speaker.wav --provider soniox --endpoint-detection off
+```
+
+Use `two_speaker_short.wav` while iterating: a run costs its own duration, since
+anything faster than 1x stops resembling a live stream to a remote service.
+
+**The generator is Windows-only (SAPI), but its output is committed.** That is
+deliberate — the fixtures have to work on macOS and Linux, where there is no
+SAPI, so a platform-specific generator must not make the testing
+platform-specific. Regenerate only on Windows, and only when changing the script:
+
+```sh
+powershell -ExecutionPolicy Bypass -File testdata/make_two_speaker.ps1
+powershell -ExecutionPolicy Bypass -File testdata/make_two_speaker.ps1 -Short
+```
+
+It fails loudly if the named voices are not installed. Because `two_speaker.wav`
+is 2.3 MB, adding it needed jj's new-file guard raised
+(`jj config set --repo snapshot.max-new-file-size 8388608`). That setting is
+per-machine and lives outside the repo, so a fresh clone does not need it —
+checking out already-tracked files is unaffected.
+
+Read the `=== SEGMENTS ===` block: each line carries `speaker=`. What is being
+checked is that a label arrives, stays stable within a turn, and changes at turn
+boundaries.
+
+> **This is a weak test of diarization *accuracy*.** Diarization models are
+> trained on human speech, and these are synthetic voices. It is a strong test
+> of the *plumbing* — that a speaker label flows wire → accumulator →
+> `TranscriptUpdate` → UI. If speakers come back merged, suspect the fixture
+> before the code, and confirm against real two-person audio.
+
+Soniox's own documentation notes that endpoint detection finalizes earlier,
+which raises WER, splits long speech into more endpoints **and reduces
+diarization accuracy** — hence `--endpoint-detection off` above. Run it both
+ways to see the difference.
 
 The two transcript goldens are currently byte-identical: forcing the reset makes
 the decoder replay buffered chunks, but those replays yield no new text. That is

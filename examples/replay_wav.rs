@@ -253,12 +253,21 @@ impl EngineEventSink for CollectSink {
 
 // ---------------------------------------------------------------------------
 
+fn parse_on_off(raw: &str) -> Result<bool, Box<dyn Error>> {
+    match raw.to_ascii_lowercase().as_str() {
+        "on" | "true" | "1" | "yes" => Ok(true),
+        "off" | "false" | "0" | "no" => Ok(false),
+        other => Err(format!("expected on|off, got {other:?}").into()),
+    }
+}
+
 fn main() -> Result<(), Box<dyn Error>> {
     let args: Vec<String> = env::args().skip(1).collect();
     if args.is_empty() || args[0].starts_with("--") {
         eprintln!(
             "usage: replay_wav <file.wav> [--speed N] [--model PATH] [--diag PATH] \
-             [--provider nemotron|soniox]"
+             [--provider nemotron|soniox] [--endpoint-detection on|off] \
+             [--diarization on|off]"
         );
         std::process::exit(2);
     }
@@ -269,6 +278,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut diag_path: Option<String> = None;
     let mut empty_reset: Option<u32> = None;
     let mut provider: Option<String> = None;
+    let mut endpoint_detection: Option<bool> = None;
+    let mut diarization: Option<bool> = None;
 
     let mut i = 1;
     while i < args.len() {
@@ -287,6 +298,22 @@ fn main() -> Result<(), Box<dyn Error>> {
             }
             "--provider" => {
                 provider = Some(args.get(i + 1).ok_or("--provider needs a value")?.clone());
+                i += 2;
+            }
+            // Soniox's own docs say endpoint detection finalizes earlier, which
+            // raises WER, splits long speech into more endpoints and reduces
+            // diarization accuracy. Being able to A/B it without editing
+            // settings.json is the difference between one run and four.
+            "--endpoint-detection" => {
+                endpoint_detection = Some(parse_on_off(
+                    args.get(i + 1).ok_or("--endpoint-detection needs on|off")?,
+                )?);
+                i += 2;
+            }
+            "--diarization" => {
+                diarization = Some(parse_on_off(
+                    args.get(i + 1).ok_or("--diarization needs on|off")?,
+                )?);
                 i += 2;
             }
             // Lowering this makes the mid-speech stuck-decoder reset (and its
@@ -329,6 +356,12 @@ fn main() -> Result<(), Box<dyn Error>> {
             }
             _ => {}
         }
+    }
+    if let Some(on) = endpoint_detection {
+        settings.soniox_endpoint_detection = on;
+    }
+    if let Some(on) = diarization {
+        settings.soniox_diarization = on;
     }
     if let Some(m) = model_override {
         settings.model_path = m;
