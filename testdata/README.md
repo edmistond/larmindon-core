@@ -51,11 +51,8 @@ powershell -ExecutionPolicy Bypass -File testdata/make_two_speaker.ps1
 powershell -ExecutionPolicy Bypass -File testdata/make_two_speaker.ps1 -Short
 ```
 
-It fails loudly if the named voices are not installed. Because `two_speaker.wav`
-is 2.3 MB, adding it needed jj's new-file guard raised
-(`jj config set --repo snapshot.max-new-file-size 8388608`). That setting is
-per-machine and lives outside the repo, so a fresh clone does not need it —
-checking out already-tracked files is unaffected.
+It fails loudly if the named voices are not installed. The generated
+`two_speaker.wav` is 2.3 MB and is tracked directly in Git.
 
 Read the `=== SEGMENTS ===` block: each line carries `speaker=`. What is being
 checked is that a label arrives, stays stable within a turn, and changes at turn
