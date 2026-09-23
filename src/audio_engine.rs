@@ -627,11 +627,17 @@ impl<E: EngineEventSink> AudioEngine<E> {
             // Check for hot-reloaded settings
             if let Ok(new_settings) = settings_rx.try_recv() {
                 println!(
-                    "[diag] Hot-reloading settings: punctuation_reset={}, empty_reset_threshold={}, vad_threshold_start={}, vad_threshold_end={}",
+                    "[diag] Hot-reloading settings: punctuation_reset={}, empty_reset_threshold={}, nemotron_language={}, vad_threshold_start={}, vad_threshold_end={}",
                     new_settings.punctuation_reset, new_settings.empty_reset_threshold,
+                    new_settings.nemotron_language,
                     new_settings.vad_threshold_start, new_settings.vad_threshold_end
                 );
-                backend.update_settings(&new_settings);
+                if let Err(e) = backend.update_settings(&new_settings) {
+                    if report_backend_error(&event_sink, &diag, &e, loop_start) {
+                        let _ = backend.end_session(&session_ctx!());
+                        return Ok((backend, vad));
+                    }
+                }
                 vad.update_params(
                     new_settings.vad_threshold_start,
                     new_settings.vad_threshold_end,

@@ -11,6 +11,84 @@ pub const VALID_ASR_PROVIDERS: &[&str] = &["nemotron", "soniox"];
 #[cfg(not(feature = "asr-soniox"))]
 pub const VALID_ASR_PROVIDERS: &[&str] = &["nemotron"];
 
+/// NVIDIA's quality tiers for Nemotron 3.5 locales, from the model card.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LanguageTier {
+    TranscriptionReady,
+    BroadCoverage,
+    /// Needs fine-tuning for production quality; the UI labels it as such.
+    AdaptationReady,
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct NemotronLanguage {
+    pub code: &'static str,
+    pub name: &'static str,
+    pub tier: LanguageTier,
+}
+
+const fn lang(code: &'static str, name: &'static str, tier: LanguageTier) -> NemotronLanguage {
+    NemotronLanguage { code, name, tier }
+}
+
+/// Locales accepted for `nemotron_language`, besides `"auto"`: the 40 on
+/// NVIDIA's Nemotron 3.5 model card, ordered by tier. parakeet-rs accepts more
+/// codes than this (its prompt dictionary is private and has slots for
+/// languages the card does not list), but those are unvalidated.
+pub const NEMOTRON_LANGUAGES: &[NemotronLanguage] = {
+    use LanguageTier::*;
+    &[
+        lang("en-US", "English (US)", TranscriptionReady),
+        lang("en-GB", "English (UK)", TranscriptionReady),
+        lang("es-US", "Spanish (US)", TranscriptionReady),
+        lang("es-ES", "Spanish (Spain)", TranscriptionReady),
+        lang("fr-FR", "French (France)", TranscriptionReady),
+        lang("fr-CA", "French (Canada)", TranscriptionReady),
+        lang("it-IT", "Italian", TranscriptionReady),
+        lang("pt-BR", "Portuguese (Brazil)", TranscriptionReady),
+        lang("pt-PT", "Portuguese (Portugal)", TranscriptionReady),
+        lang("nl-NL", "Dutch", TranscriptionReady),
+        lang("de-DE", "German", TranscriptionReady),
+        lang("tr-TR", "Turkish", TranscriptionReady),
+        lang("ru-RU", "Russian", TranscriptionReady),
+        lang("ar-AR", "Arabic", TranscriptionReady),
+        lang("hi-IN", "Hindi", TranscriptionReady),
+        lang("ja-JP", "Japanese", TranscriptionReady),
+        lang("ko-KR", "Korean", TranscriptionReady),
+        lang("vi-VN", "Vietnamese", TranscriptionReady),
+        lang("uk-UA", "Ukrainian", TranscriptionReady),
+        lang("pl-PL", "Polish", BroadCoverage),
+        lang("sv-SE", "Swedish", BroadCoverage),
+        lang("cs-CZ", "Czech", BroadCoverage),
+        lang("nb-NO", "Norwegian Bokmål", BroadCoverage),
+        lang("da-DK", "Danish", BroadCoverage),
+        lang("bg-BG", "Bulgarian", BroadCoverage),
+        lang("fi-FI", "Finnish", BroadCoverage),
+        lang("hr-HR", "Croatian", BroadCoverage),
+        lang("sk-SK", "Slovak", BroadCoverage),
+        lang("zh-CN", "Mandarin", BroadCoverage),
+        lang("hu-HU", "Hungarian", BroadCoverage),
+        lang("ro-RO", "Romanian", BroadCoverage),
+        lang("et-EE", "Estonian", BroadCoverage),
+        lang("el-GR", "Greek", AdaptationReady),
+        lang("lt-LT", "Lithuanian", AdaptationReady),
+        lang("lv-LV", "Latvian", AdaptationReady),
+        lang("mt-MT", "Maltese", AdaptationReady),
+        lang("sl-SI", "Slovenian", AdaptationReady),
+        lang("he-IL", "Hebrew", AdaptationReady),
+        lang("th-TH", "Thai", AdaptationReady),
+        lang("nn-NO", "Norwegian Nynorsk", AdaptationReady),
+    ]
+};
+
+/// Language-agnostic decoding: the model detects the language itself.
+pub const NEMOTRON_LANGUAGE_AUTO: &str = "auto";
+
+pub fn is_valid_nemotron_language(code: &str) -> bool {
+    code == NEMOTRON_LANGUAGE_AUTO || NEMOTRON_LANGUAGES.iter().any(|l| l.code == code)
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
@@ -22,6 +100,9 @@ pub struct Settings {
     pub inter_threads: usize,
     pub punctuation_reset: bool,
     pub empty_reset_threshold: u32,
+    /// Target language for a multilingual Nemotron model: `"auto"` or a code
+    /// from [`NEMOTRON_LANGUAGES`]. Ignored by the English-only model.
+    pub nemotron_language: String,
     /// Font family for transcript display. Empty string = use default.
     pub font_family: String,
     /// Font size in px for transcript display. 0 = use default.
@@ -66,6 +147,7 @@ impl fmt::Debug for Settings {
             .field("inter_threads", &self.inter_threads)
             .field("punctuation_reset", &self.punctuation_reset)
             .field("empty_reset_threshold", &self.empty_reset_threshold)
+            .field("nemotron_language", &self.nemotron_language)
             .field("font_family", &self.font_family)
             .field("font_size_px", &self.font_size_px)
             .field("theme_mode", &self.theme_mode)
@@ -104,6 +186,7 @@ impl Default for Settings {
             inter_threads: 1,
             punctuation_reset: true,
             empty_reset_threshold: 6,
+            nemotron_language: NEMOTRON_LANGUAGE_AUTO.to_string(),
             font_family: String::new(),
             font_size_px: 0,
             theme_mode: "dark".to_string(),
@@ -250,6 +333,18 @@ impl Settings {
             }
         }
 
+        if let Ok(val) = std::env::var("NEMOTRON_LANG") {
+            if is_valid_nemotron_language(&val) {
+                println!("Using NEMOTRON_LANG={val} from environment");
+                self.nemotron_language = val;
+            } else {
+                eprintln!(
+                    "Unknown NEMOTRON_LANG={val:?}; keeping saved value {:?}.",
+                    self.nemotron_language
+                );
+            }
+        }
+
         if let Ok(val) = std::env::var("SONIOX_API_KEY") {
             if val.trim().is_empty() {
                 eprintln!("SONIOX_API_KEY is empty, keeping saved value.");
@@ -312,6 +407,12 @@ impl Settings {
         }
         if self.model_path.trim().is_empty() {
             return Err("model_path cannot be empty".to_string());
+        }
+        if !is_valid_nemotron_language(&self.nemotron_language) {
+            return Err(format!(
+                "Invalid nemotron_language '{}'; must be \"auto\" or a supported locale such as \"en-US\"",
+                self.nemotron_language
+            ));
         }
         if !VALID_THEMES.contains(&self.theme_mode.as_str()) {
             return Err(format!(
@@ -704,6 +805,53 @@ mod tests {
             ..Default::default()
         };
         assert!(s.validate().is_err());
+    }
+
+    #[test]
+    fn nemotron_language_defaults_to_auto() {
+        assert_eq!(Settings::default().nemotron_language, "auto");
+        let s: Settings = serde_json::from_str(r#"{"chunk_ms":560}"#).unwrap();
+        assert_eq!(s.nemotron_language, "auto");
+    }
+
+    #[test]
+    fn validate_accepts_every_listed_nemotron_language() {
+        for l in NEMOTRON_LANGUAGES {
+            let s = Settings {
+                nemotron_language: l.code.to_string(),
+                ..Default::default()
+            };
+            assert!(s.validate().is_ok(), "{} should be valid", l.code);
+        }
+    }
+
+    #[test]
+    fn validate_rejects_unknown_nemotron_language() {
+        for bad in ["", "xx-XX", "en_us", "EN-US"] {
+            let s = Settings {
+                nemotron_language: bad.to_string(),
+                ..Default::default()
+            };
+            let err = s.validate().expect_err(bad);
+            assert!(err.contains("nemotron_language"));
+        }
+    }
+
+    #[test]
+    fn nemotron_language_list_matches_the_model_card() {
+        let count = |tier| NEMOTRON_LANGUAGES.iter().filter(|l| l.tier == tier).count();
+        assert_eq!(NEMOTRON_LANGUAGES.len(), 40);
+        assert_eq!(count(LanguageTier::TranscriptionReady), 19);
+        assert_eq!(count(LanguageTier::BroadCoverage), 13);
+        assert_eq!(count(LanguageTier::AdaptationReady), 8);
+        // Ordered by tier, so a UI can render it without sorting.
+        assert!(NEMOTRON_LANGUAGES
+            .windows(2)
+            .all(|w| w[0].tier as u8 <= w[1].tier as u8));
+        let mut codes: Vec<_> = NEMOTRON_LANGUAGES.iter().map(|l| l.code).collect();
+        codes.sort_unstable();
+        codes.dedup();
+        assert_eq!(codes.len(), 40, "duplicate code");
     }
 
     #[test]

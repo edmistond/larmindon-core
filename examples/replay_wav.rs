@@ -40,7 +40,7 @@ use larmindon_core::audio_capture::{
     DeviceType, StartedAudioStream,
 };
 use larmindon_core::audio_engine::{AudioEngine, Command};
-use larmindon_core::settings::Settings;
+use larmindon_core::settings::{self, Settings};
 use larmindon_core::EngineEventSink;
 
 // ---------------------------------------------------------------------------
@@ -267,7 +267,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         eprintln!(
             "usage: replay_wav <file.wav> [--speed N] [--model PATH] [--diag PATH] \
              [--provider nemotron|soniox] [--endpoint-detection on|off] \
-             [--diarization on|off]"
+             [--diarization on|off] [--empty-reset N] [--lang auto|en-US|...]"
         );
         std::process::exit(2);
     }
@@ -280,6 +280,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut provider: Option<String> = None;
     let mut endpoint_detection: Option<bool> = None;
     let mut diarization: Option<bool> = None;
+    let mut lang: Option<String> = None;
 
     let mut i = 1;
     while i < args.len() {
@@ -326,6 +327,17 @@ fn main() -> Result<(), Box<dyn Error>> {
                 );
                 i += 2;
             }
+            // Target language for a multilingual Nemotron model. Validated
+            // here, as settings.json would be, rather than left to fall back
+            // to auto at session start where a typo is easy to miss.
+            "--lang" => {
+                let code = args.get(i + 1).ok_or("--lang needs a value")?;
+                if !settings::is_valid_nemotron_language(code) {
+                    return Err(format!("unknown --lang {code:?}").into());
+                }
+                lang = Some(code.clone());
+                i += 2;
+            }
             other => return Err(format!("unknown argument: {other}").into()),
         }
     }
@@ -368,6 +380,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
     if let Some(t) = empty_reset {
         settings.empty_reset_threshold = t;
+    }
+    if let Some(l) = lang {
+        settings.nemotron_language = l;
     }
     settings.diagnostics_enabled = diag_path.is_some();
     if let Some(p) = diag_path {

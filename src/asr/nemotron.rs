@@ -10,17 +10,21 @@ use std::time::Instant;
 
 #[cfg(any(feature = "webgpu", feature = "directml", feature = "migraphx"))]
 use parakeet_rs::ExecutionProvider;
-use parakeet_rs::{ExecutionConfig, Nemotron};
+use parakeet_rs::{ExecutionConfig, Nemotron, NemotronMode};
 
 use super::{
     ActivitySource, AsrBackend, AsrCapabilities, AsrContext, AsrError, AudioGating, SessionContext,
-    TranscriptUpdate,
+    TranscriptUpdate, SENTENCE_TERMINATORS,
 };
 use crate::diag::{
     AsrErrorRow, MidSpeechResetRow, PunctuationResetRow, SpeechEndRow, TranscribeRow,
 };
-use crate::settings::{self, Settings};
+use crate::settings::{self, Settings, NEMOTRON_LANGUAGE_AUTO};
 use crate::vad::VadState;
+
+/// Samples per encoder step for the 560 ms exports the chunking and reset
+/// heuristics were tuned on. Both the English model and Nemotron 3.5 use it.
+const EXPECTED_ENCODER_CHUNK_SAMPLES: usize = 8960;
 
 /// Recent chunks kept so they can be re-run through a freshly reset decoder.
 struct ReplayBuffer {
@@ -81,6 +85,9 @@ pub struct NemotronBackend {
     empty_reset_threshold: u32,
     replay_buffer: ReplayBuffer,
     pending_speech_end_resets: VecDeque<PendingSpeechEndReset>,
+    /// Language in effect on a multilingual model; `None` on the English-only
+    /// one, which takes no language.
+    target_lang: Option<String>,
 }
 
 impl NemotronBackend {
@@ -96,6 +103,7 @@ impl NemotronBackend {
             empty_reset_threshold: 1,
             replay_buffer: ReplayBuffer::new(0),
             pending_speech_end_resets: VecDeque::new(),
+            target_lang: None,
         }
     }
 }
@@ -163,6 +171,48 @@ impl AsrBackend for NemotronBackend {
             self.model = Some(m);
         }
 
+        // Variant detection happens at load, so this is also what confirms
+        // which model a path actually pointed at.
+        let model = self.model.as_mut().expect("loaded or cached above");
+        let mode = model.mode();
+        if model.chunk_samples() != EXPECTED_ENCODER_CHUNK_SAMPLES {
+            eprintln!(
+                "Warning: Nemotron encoder step is {} samples, expected {}; \
+                 chunking and reset heuristics were tuned for 560 ms",
+                model.chunk_samples(),
+                EXPECTED_ENCODER_CHUNK_SAMPLES
+            );
+        }
+        // The language is applied on every session, not only on load: a cached
+        // model keeps the previous session's language across `reset()`.
+        self.target_lang = match mode {
+            NemotronMode::Multilingual => {
+                let (lang, fallback) = apply_target_lang(model, &settings.nemotron_language);
+                if let Some(message) = fallback {
+                    eprintln!("[asr] {message}");
+                    ctx.diag
+                        .backend_error(ctx.uptime_ms(), "transient", &message);
+                }
+                Some(lang)
+            }
+            NemotronMode::EnglishOnly => {
+                if settings.nemotron_language != NEMOTRON_LANGUAGE_AUTO {
+                    println!(
+                        "nemotron_language={} ignored: the English-only model takes no language",
+                        settings.nemotron_language
+                    );
+                }
+                None
+            }
+        };
+        println!(
+            "Nemotron mode: {}, language: {}",
+            mode_label(mode),
+            self.target_lang.as_deref().unwrap_or("n/a")
+        );
+        ctx.diag
+            .session_model(mode_label(mode), self.target_lang.as_deref());
+
         self.chunk_size = settings::chunk_ms_to_samples(settings.chunk_ms);
         self.punctuation_reset_enabled = settings.punctuation_reset;
         self.empty_reset_threshold = settings.empty_reset_threshold;
@@ -198,11 +248,36 @@ impl AsrBackend for NemotronBackend {
         self.chunk_num
     }
 
-    fn update_settings(&mut self, settings: &Settings) {
+    fn update_settings(&mut self, settings: &Settings) -> Result<(), AsrError> {
         self.punctuation_reset_enabled = settings.punctuation_reset;
         self.empty_reset_threshold = settings.empty_reset_threshold;
         self.replay_buffer
             .update_capacity(self.empty_reset_threshold as usize);
+
+        // Only a multilingual model has a language to change, and it changes
+        // without a reload: the engine's model cache is keyed on path and
+        // threads, never on language.
+        let (Some(model), Some(current)) = (self.model.as_mut(), self.target_lang.as_deref())
+        else {
+            return Ok(());
+        };
+        if settings.nemotron_language == current {
+            return Ok(());
+        }
+        let (lang, fallback) = apply_target_lang(model, &settings.nemotron_language);
+        // parakeet-rs applies the language from the next encoder call; reset
+        // so the new prompt starts a fresh utterance instead of conditioning
+        // one decoded half in the old language.
+        model.reset();
+        self.chunks_since_decoder_reset = 0;
+        self.consecutive_empty = 0;
+        self.replay_buffer.clear();
+        println!("Nemotron language changed: {current} -> {lang}");
+        self.target_lang = Some(lang);
+        match fallback {
+            Some(message) => Err(AsrError::Transient(message)),
+            None => Ok(()),
+        }
     }
 
     /// Stopping mid-utterance discards whatever sits in `asr_buffer` below one
@@ -224,6 +299,7 @@ impl AsrBackend for NemotronBackend {
             empty_reset_threshold,
             replay_buffer,
             pending_speech_end_resets,
+            target_lang: _,
         } = self;
 
         let model = model
@@ -434,6 +510,30 @@ impl AsrBackend for NemotronBackend {
     }
 }
 
+/// Sets `requested` on a multilingual model. If parakeet-rs rejects it, falls
+/// back to auto-detection rather than failing the session. Returns the language
+/// now in effect and, on fallback, a message to report.
+fn apply_target_lang(model: &mut Nemotron, requested: &str) -> (String, Option<String>) {
+    match model.set_target_lang(requested) {
+        Ok(()) => (requested.to_string(), None),
+        Err(e) => {
+            let message =
+                format!("Nemotron rejected language '{requested}' ({e}); using auto-detect");
+            // "auto" is always in the prompt dictionary, so this cannot fail on
+            // a multilingual model.
+            let _ = model.set_target_lang(NEMOTRON_LANGUAGE_AUTO);
+            (NEMOTRON_LANGUAGE_AUTO.to_string(), Some(message))
+        }
+    }
+}
+
+fn mode_label(mode: NemotronMode) -> &'static str {
+    match mode {
+        NemotronMode::EnglishOnly => "english",
+        NemotronMode::Multilingual => "multilingual",
+    }
+}
+
 fn pad_to_chunk_boundary(buffer: &mut Vec<f32>, chunk_size: usize) {
     if buffer.is_empty() || chunk_size == 0 {
         return;
@@ -458,27 +558,28 @@ fn text_preview(text: &str, max_bytes: usize) -> String {
     text[..end].to_string()
 }
 
-/// Check if text ends with sentence-ending punctuation (`.`, `?`, `!`),
-/// filtering out ellipsis and decimal-looking patterns.
+/// Check if text ends with sentence-ending punctuation (`.`, `?`, `!`, and the
+/// full-width `。`, `？`, `！` that Nemotron 3.5 emits for CJK), filtering out
+/// ellipsis and decimal-looking patterns.
 pub fn ends_with_sentence_punctuation(text: &str) -> bool {
     let trimmed = text.trim_end();
-    if trimmed.is_empty() {
+    let Some(last) = trimmed.chars().last() else {
+        return false;
+    };
+    if !SENTENCE_TERMINATORS.contains(&last) {
         return false;
     }
-    match trimmed.as_bytes()[trimmed.len() - 1] {
-        b'?' | b'!' => true,
-        b'.' => {
-            // Filter out ellipsis ("...")
-            if trimmed.ends_with("...") {
-                return false;
-            }
-            // Filter out decimal-looking patterns (digit before ".")
-            let before_dot = &trimmed[..trimmed.len() - 1];
-            let last_char = before_dot.trim_end().bytes().last();
-            !matches!(last_char, Some(b'0'..=b'9'))
-        }
-        _ => false,
+    if last != '.' {
+        return true;
     }
+    // Filter out ellipsis ("...")
+    if trimmed.ends_with("...") {
+        return false;
+    }
+    // Filter out decimal-looking patterns (digit before ".")
+    let before_dot = &trimmed[..trimmed.len() - 1];
+    let last_char = before_dot.trim_end().bytes().last();
+    !matches!(last_char, Some(b'0'..=b'9'))
 }
 
 #[cfg(test)]
@@ -538,6 +639,20 @@ mod tests {
         assert!(!ends_with_sentence_punctuation("Hello"));
         assert!(!ends_with_sentence_punctuation("Hello,"));
         assert!(!ends_with_sentence_punctuation("Hello;"));
+    }
+
+    #[test]
+    fn full_width_terminators_are_sentence_punctuation() {
+        assert!(ends_with_sentence_punctuation("今日は晴れです。"));
+        assert!(ends_with_sentence_punctuation("你好吗？"));
+        assert!(ends_with_sentence_punctuation("太好了！"));
+        assert!(ends_with_sentence_punctuation("今日は晴れです。 "));
+    }
+
+    #[test]
+    fn full_width_comma_is_not_sentence_punctuation() {
+        assert!(!ends_with_sentence_punctuation("今日は、"));
+        assert!(!ends_with_sentence_punctuation("今日は"));
     }
 
     #[test]

@@ -247,7 +247,9 @@ impl AsrBackend for SonioxBackend {
 
     /// Every Soniox parameter is fixed by the start frame, so none of them can
     /// change without a new socket. They take effect on the next Start.
-    fn update_settings(&mut self, _settings: &Settings) {}
+    fn update_settings(&mut self, _settings: &Settings) -> Result<(), AsrError> {
+        Ok(())
+    }
 
     fn end_session(&mut self, ctx: &SessionContext) -> Result<Vec<TranscriptUpdate>, AsrError> {
         // Third layer of re-entrancy safety: taking the client means a second

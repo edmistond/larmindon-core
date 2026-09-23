@@ -21,10 +21,7 @@
 //! from final tokens.
 
 use super::protocol::{SonioxResponse, SonioxToken};
-use crate::asr::{SegmentIds, SpeakerId, TranscriptUpdate};
-
-/// Sentence terminators, including the full-width CJK forms.
-const TERMINATORS: [char; 6] = ['.', '!', '?', '。', '！', '？'];
+use crate::asr::{SegmentIds, SpeakerId, TranscriptUpdate, SENTENCE_TERMINATORS as TERMINATORS};
 /// Closing punctuation allowed to trail a terminator (`end."` still ends a
 /// sentence).
 const CLOSERS: [char; 7] = ['"', '\'', '”', '’', ')', ']', '}'];

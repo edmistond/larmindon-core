@@ -29,6 +29,10 @@ pub mod nemotron;
 #[cfg(feature = "asr-soniox")]
 pub mod soniox;
 
+/// Sentence terminators, including the full-width CJK forms. Shared by every
+/// backend that segments or resets on a sentence boundary.
+pub(crate) const SENTENCE_TERMINATORS: [char; 6] = ['.', '!', '?', '。', '！', '？'];
+
 /// A stable speaker identity within one session. Serializes as a bare JSON
 /// string, so the frontend sees `speaker: "1" | null`. Providers without
 /// diarization never produce one.
@@ -232,8 +236,9 @@ pub trait AsrBackend: Send {
     }
 
     /// Hot-reload of settings mid-session. Apply what can change live, ignore
-    /// the rest.
-    fn update_settings(&mut self, settings: &Settings);
+    /// the rest. An error is reported like one from [`AsrBackend::process`]:
+    /// `Transient` leaves the session running, `Fatal` ends it.
+    fn update_settings(&mut self, settings: &Settings) -> Result<(), AsrError>;
 
     /// Tear down, returning final updates for any open segments.
     fn end_session(&mut self, ctx: &SessionContext) -> Result<Vec<TranscriptUpdate>, AsrError>;

@@ -192,6 +192,17 @@ impl DiagSink {
         );
     }
 
+    /// Records which model variant actually loaded and the language it was
+    /// set to. Written after `begin_session`, because the variant is only
+    /// known once the model is loaded.
+    pub fn session_model(&self, model_mode: &str, target_lang: Option<&str>) {
+        let Some(db) = self.live() else { return };
+        let _ = db.execute(
+            "UPDATE sessions SET model_mode = ?2, target_lang = ?3 WHERE id = ?1",
+            rusqlite::params![self.session_id, model_mode, target_lang],
+        );
+    }
+
     pub fn shutdown(&self, uptime_ms: i64, chunk_num: u64) {
         let Some(db) = self.live() else { return };
         let _ = db.execute(
@@ -357,6 +368,8 @@ fn init_diag_db(db_path: Option<&Path>) -> Result<Option<Connection>, Box<dyn st
         &conn,
         "ALTER TABLE vad_events ADD COLUMN replay_inference_ms INTEGER;",
     );
+    migrate_add_column(&conn, "ALTER TABLE sessions ADD COLUMN model_mode TEXT;");
+    migrate_add_column(&conn, "ALTER TABLE sessions ADD COLUMN target_lang TEXT;");
     Ok(Some(conn))
 }
 
