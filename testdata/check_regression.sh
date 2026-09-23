@@ -59,7 +59,11 @@ else
   echo "  FAIL (transcript)"; head -40 "$work/d2"; fail=1
 fi
 
-if python "$here/dump_diag.py" "$work/reset.sqlite" > "$work/reset_diag.txt" 2>"$work/pyerr"; then
+# python3 first: macOS and most Linux installs have no bare `python`. CRs are
+# stripped because Python on Windows prints CRLF and the golden is LF.
+py="$(command -v python3 || command -v python)"
+if "${py:-python3}" "$here/dump_diag.py" "$work/reset.sqlite" 2>"$work/pyerr" \
+  | tr -d '\r' > "$work/reset_diag.txt"; then
   if diff -u "$here/golden_reset_diag.txt" "$work/reset_diag.txt" > "$work/d3"; then
     echo "  PASS (diagnostics)"
   else
