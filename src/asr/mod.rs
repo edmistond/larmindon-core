@@ -186,6 +186,10 @@ pub struct AsrContext<'a> {
 
 pub trait AsrBackend: Send {
     fn id(&self) -> &'static str;
+
+    /// Read by the engine after [`AsrBackend::begin_session`], and may depend
+    /// on what that session set up: Nemotron revises and labels its output
+    /// only while a diarizer is running.
     fn capabilities(&self) -> AsrCapabilities;
 
     /// Whether the engine may keep this instance alive between sessions.

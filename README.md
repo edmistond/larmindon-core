@@ -52,7 +52,7 @@ impl EngineEventSink for MyEventSink {
 |---------|---------|-------------|
 | `cpal` | Yes | Cross-platform audio capture via CPAL |
 | `pipewire` | Yes | PipeWire audio capture (Linux only) |
-| `diarization` | Yes | Sortformer v3 speaker diarization beside Nemotron (`nemotron_diarization`, on by default; without the model file Nemotron runs without speakers) |
+| `diarization` | Yes | Sortformer v3 speaker labels for Nemotron (`nemotron_diarization`, on by default; without the model file Nemotron runs without speakers). Text is emitted provisionally, then finalized with a speaker once the diarizer covers it. The diarizer (~380 MB) stays loaded beside the ASR model (~2.4 GB) |
 | `webgpu` | No | WebGPU (Metal) execution provider for ASR |
 | `directml` | No | DirectML execution provider for ASR (Windows) |
 | `migraphx` | No | MIGraphX execution provider for ASR |

@@ -9,9 +9,11 @@
 //! cargo run --release --example replay_wav -- fixture.wav --speed 2 --diag out.sqlite
 //! ```
 //!
-//! Output is written to stdout as `[NN] <text>` lines (one per emission) plus a
-//! `=== TRANSCRIPT ===` block holding the concatenation the UI would build.
-//! Diff those between runs to detect a behaviour change.
+//! Output is written to stdout as `[NN] <text>` lines (one per final segment)
+//! plus a `=== TRANSCRIPT ===` block holding the concatenation the UI would
+//! build. Diff those between runs to detect a behaviour change. A
+//! `=== SEGMENTS ===` block lists every update, provisional ones included,
+//! with its speaker.
 //!
 //! `--provider` selects the ASR backend, which is how the Soniox socket client
 //! is exercised without the GUI — by far the fastest iteration loop for the
@@ -229,7 +231,12 @@ struct CollectSink {
 impl EngineEventSink for CollectSink {
     fn on_transcript_update(&self, update: TranscriptUpdate) {
         let speaker = update.speaker.as_ref().map(|s| s.0.as_str()).unwrap_or("-");
-        self.lines.lock().unwrap().push(update.text.clone());
+        // Finals only: a provisional update is superseded by its final, so
+        // counting both would repeat the text. Append-only runs emit nothing
+        // else, so this leaves their goldens unchanged.
+        if update.is_final {
+            self.lines.lock().unwrap().push(update.text.clone());
+        }
         self.updates.lock().unwrap().push(format!(
             "id={} final={} speaker={} text={:?}",
             update.segment_id, update.is_final, speaker, update.text

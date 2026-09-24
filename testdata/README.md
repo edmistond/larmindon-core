@@ -64,9 +64,9 @@ Things these goldens record, which are not bugs in the harness:
 
 ## The two-speaker fixtures
 
-These exercise the Soniox path. No golden is attached to either — a cloud
-model's output is not reproducible — so they are **not** part of
-`check_regression.sh`.
+These exercise diarization: Soniox's, and the Sortformer diarizer beside
+Nemotron. No golden is attached to either — a cloud model's output is not
+reproducible — so they are **not** part of `check_regression.sh`.
 
 Both use SSML voice switching, so the two speakers share one continuous stream
 rather than being concatenated files. Turn boundaries then look like a
@@ -79,6 +79,20 @@ SONIOX_API_KEY=... cargo run --release --example replay_wav -- \
 
 Use `two_speaker_short.wav` while iterating: a run costs its own duration, since
 anything faster than 1x stops resembling a live stream to a remote service.
+
+For Nemotron with the Sortformer diarizer (`~/models/nemotron3_diar_v3.onnx`
+by default):
+
+```sh
+cargo run --release --example replay_wav -- \
+  testdata/two_speaker.wav --provider nemotron --diarization on
+```
+
+Each chunk's text appears in `=== SEGMENTS ===` twice: first `final=false`
+with the last settled speaker, then `final=true` with its own. The emissions and
+transcript are built from finals only, so they match a `--diarization off` run
+of the same model byte for byte. With both the English model and 3.5, all 10
+turn changes land on the right chunk.
 
 **The generator is Windows-only (SAPI), but its output is committed.** That is
 deliberate — the fixtures have to work on macOS and Linux, where there is no
@@ -174,8 +188,9 @@ is nothing of the sort. Do not remove that flag.
 
 It pins `--diarization off` for the same reason. `nemotron_diarization`
 defaults to on, so without the pin the gate would run the Sortformer diarizer
-whenever its model is installed. Today that only adds diagnostics, but once speakers are attributed it
-changes the emitted segments.
+whenever its model is installed, and diarized output is emitted as provisional
+segments that are later finalized with a speaker — a different stream of
+updates, even though the text is the same.
 
 
 `replay_wav` runs a warm-up session with its audio feeder gated off, purely to

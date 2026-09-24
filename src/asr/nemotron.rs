@@ -1,14 +1,16 @@
 //! On-device streaming ASR via `parakeet-rs` (Nemotron).
 //!
-//! Append-only: every segment is emitted already final, each id once, and the
-//! speaker is always `None`. Moved out of `audio_engine.rs` unchanged — the
-//! chunking, the replay buffer and all four decoder-reset mechanisms behave
-//! exactly as they did inline.
+//! Without diarization, append-only: every segment is emitted already final,
+//! each id once, and the speaker is always `None`. Moved out of
+//! `audio_engine.rs` unchanged — the chunking, the replay buffer and all four
+//! decoder-reset mechanisms behave exactly as they did inline.
 //!
 //! With `nemotron_diarization` on, a Sortformer diarizer is fed the same live
-//! chunks (see [`diarizer`]). Its segments are logged to diagnostics only; the
-//! transcript output is unchanged.
+//! chunks (see [`diarizer`]), and each chunk's text is emitted non-final, then
+//! final once the diarizer has labelled it (see [`attribution`]). The text
+//! itself is unchanged.
 
+mod attribution;
 #[cfg(feature = "diarization")]
 mod diarizer;
 
@@ -37,8 +39,16 @@ const EXPECTED_ENCODER_CHUNK_SAMPLES: usize = 8960;
 
 /// Recent chunks kept so they can be re-run through a freshly reset decoder.
 struct ReplayBuffer {
-    chunks: VecDeque<Vec<f32>>,
+    chunks: VecDeque<ReplayChunk>,
     max_chunks: usize,
+}
+
+/// A live chunk and where it sits on the session's sample clock, so replayed
+/// text is attributed to the audio it came from, not to when it was re-run.
+#[derive(Debug, Clone, PartialEq)]
+struct ReplayChunk {
+    start: u64,
+    samples: Vec<f32>,
 }
 
 struct PendingSpeechEndReset {
@@ -60,11 +70,14 @@ impl ReplayBuffer {
         self.truncate_to_capacity();
     }
 
-    fn push(&mut self, chunk: &[f32]) {
+    fn push(&mut self, start: u64, chunk: &[f32]) {
         if self.max_chunks == 0 {
             return;
         }
-        self.chunks.push_back(chunk.to_vec());
+        self.chunks.push_back(ReplayChunk {
+            start,
+            samples: chunk.to_vec(),
+        });
         self.truncate_to_capacity();
     }
 
@@ -72,8 +85,14 @@ impl ReplayBuffer {
         self.chunks.clear();
     }
 
-    fn snapshot(&self) -> Vec<Vec<f32>> {
+    fn snapshot(&self) -> Vec<ReplayChunk> {
         self.chunks.iter().cloned().collect()
+    }
+
+    /// Start of the oldest chunk a replay could still re-run.
+    #[cfg_attr(not(feature = "diarization"), allow(dead_code))]
+    fn oldest_start(&self) -> Option<u64> {
+        self.chunks.front().map(|c| c.start)
     }
 
     fn truncate_to_capacity(&mut self) {
@@ -94,6 +113,9 @@ pub struct NemotronBackend {
     empty_reset_threshold: u32,
     replay_buffer: ReplayBuffer,
     pending_speech_end_resets: VecDeque<PendingSpeechEndReset>,
+    /// Live samples consumed this session: the clock chunk ranges, and the
+    /// diarizer's segments, are measured on.
+    samples_consumed: u64,
     /// Language in effect on a multilingual model; `None` on the English-only
     /// one, which takes no language.
     target_lang: Option<String>,
@@ -101,6 +123,9 @@ pub struct NemotronBackend {
     /// model; reloaded only if its path changes.
     #[cfg(feature = "diarization")]
     diarizer: Option<diarizer::Diarizer>,
+    /// Present exactly while a diarizer is running this session. `None` keeps
+    /// the append-only output path byte for byte.
+    attribution: Option<attribution::Attribution>,
 }
 
 impl NemotronBackend {
@@ -116,9 +141,11 @@ impl NemotronBackend {
             empty_reset_threshold: 1,
             replay_buffer: ReplayBuffer::new(0),
             pending_speech_end_resets: VecDeque::new(),
+            samples_consumed: 0,
             target_lang: None,
             #[cfg(feature = "diarization")]
             diarizer: None,
+            attribution: None,
         }
     }
 
@@ -136,6 +163,10 @@ impl NemotronBackend {
             ctx.diag
                 .backend_error(ctx.uptime_ms(), "transient", &message);
         }
+        self.attribution = self
+            .diarizer
+            .is_some()
+            .then(attribution::Attribution::default);
     }
 
     #[cfg(feature = "diarization")]
@@ -204,10 +235,13 @@ impl AsrBackend for NemotronBackend {
         "nemotron"
     }
 
+    /// Reflects the session in progress: labelled output is revised once, from
+    /// provisional to final.
     fn capabilities(&self) -> AsrCapabilities {
+        let diarizing = self.attribution.is_some();
         AsrCapabilities {
-            revises_output: false,
-            diarization: false,
+            revises_output: diarizing,
+            diarization: diarizing,
             audio_gating: AudioGating::VadGated,
             activity_source: ActivitySource::Vad,
         }
@@ -295,6 +329,7 @@ impl AsrBackend for NemotronBackend {
         self.chunk_num = 0;
         self.consecutive_empty = 0;
         self.chunks_since_decoder_reset = 0;
+        self.samples_consumed = 0;
 
         #[cfg(feature = "diarization")]
         self.begin_diarization(ctx);
@@ -359,18 +394,30 @@ impl AsrBackend for NemotronBackend {
     /// Stopping mid-utterance discards whatever sits in `asr_buffer` below one
     /// chunk. That is existing behaviour and is deliberately preserved —
     /// flushing the tail here would change Nemotron's output.
+    ///
+    /// With diarization, every provisional segment is finalized here with the
+    /// best label available.
     fn end_session(&mut self, ctx: &SessionContext) -> Result<Vec<TranscriptUpdate>, AsrError> {
         #[cfg(feature = "diarization")]
         if let Some(diarizer) = self.diarizer.as_mut() {
             match diarizer.flush() {
-                Ok(step) => log_diarize(ctx.diag, ctx.uptime_ms(), "flush", diarizer, &step),
+                Ok(step) => {
+                    log_diarize(ctx.diag, ctx.uptime_ms(), "flush", diarizer, &step);
+                    if let Some(attribution) = self.attribution.as_mut() {
+                        attribution.add_segments(step.spans());
+                    }
+                }
                 Err(message) => report_diarizer_error(ctx.diag, ctx.uptime_ms(), &message),
             }
             println!("Diarization: {}", diarizer.summary());
         }
         #[cfg(not(feature = "diarization"))]
         let _ = ctx;
-        Ok(Vec::new())
+        Ok(self
+            .attribution
+            .as_mut()
+            .map(attribution::Attribution::finalize_all)
+            .unwrap_or_default())
     }
 
     fn process(&mut self, ctx: &AsrContext) -> Result<Vec<TranscriptUpdate>, AsrError> {
@@ -385,9 +432,11 @@ impl AsrBackend for NemotronBackend {
             empty_reset_threshold,
             replay_buffer,
             pending_speech_end_resets,
+            samples_consumed,
             target_lang: _,
             #[cfg(feature = "diarization")]
             diarizer,
+            attribution,
         } = self;
 
         let model = model
@@ -416,9 +465,11 @@ impl AsrBackend for NemotronBackend {
         while asr_buffer.len().saturating_sub(asr_consumed) >= chunk_size {
             let chunk = &asr_buffer[asr_consumed..asr_consumed + chunk_size];
             asr_consumed += chunk_size;
+            let chunk_start = *samples_consumed;
+            *samples_consumed += chunk_size as u64;
             let vad_is_speech = stats.vad_state == VadState::Speech;
             if vad_is_speech {
-                replay_buffer.push(chunk);
+                replay_buffer.push(chunk_start, chunk);
             }
             *chunks_since_decoder_reset += 1;
             let infer_start = Instant::now();
@@ -469,12 +520,13 @@ impl AsrBackend for NemotronBackend {
                     }
 
                     if !is_empty {
-                        out.push(TranscriptUpdate {
-                            segment_id: ids.next(),
-                            is_final: true,
+                        out.push(text_update(
+                            attribution.as_mut(),
+                            ids.next(),
+                            chunk_start,
+                            chunk_size,
                             text,
-                            speaker: None,
-                        });
+                        ));
                     }
 
                     // Mid-speech reset heuristic
@@ -496,7 +548,7 @@ impl AsrBackend for NemotronBackend {
                         for replay_chunk in &replay_chunks {
                             *chunks_since_decoder_reset += 1;
                             let infer_start = Instant::now();
-                            match model.transcribe_chunk(replay_chunk) {
+                            match model.transcribe_chunk(&replay_chunk.samples) {
                                 Ok(text) => {
                                     let infer_ms = infer_start.elapsed().as_millis() as i64;
                                     replay_inference_ms += infer_ms;
@@ -526,12 +578,13 @@ impl AsrBackend for NemotronBackend {
 
                                     if !is_empty {
                                         replay_nonempty_chunks += 1;
-                                        out.push(TranscriptUpdate {
-                                            segment_id: ids.next(),
-                                            is_final: true,
+                                        out.push(text_update(
+                                            attribution.as_mut(),
+                                            ids.next(),
+                                            replay_chunk.start,
+                                            replay_chunk.samples.len(),
                                             text,
-                                            speaker: None,
-                                        });
+                                        ));
                                     }
                                 }
                                 Err(e) => {
@@ -576,11 +629,18 @@ impl AsrBackend for NemotronBackend {
             if let Some(diarizer) = diarizer.as_mut() {
                 let uptime_ms = ctx.session.uptime_ms();
                 match diarizer.feed(chunk) {
-                    Ok(step) => log_diarize(diag, uptime_ms, "feed", diarizer, &step),
+                    Ok(step) => {
+                        log_diarize(diag, uptime_ms, "feed", diarizer, &step);
+                        if let Some(attribution) = attribution.as_mut() {
+                            attribution.add_segments(step.spans());
+                        }
+                    }
                     Err(message) => report_diarizer_error(diag, uptime_ms, &message),
                 }
             }
 
+            #[cfg(feature = "diarization")]
+            let mut speech_ended = false;
             while pending_speech_end_resets
                 .front()
                 .is_some_and(|reset| asr_consumed >= reset.reset_after_samples)
@@ -600,6 +660,30 @@ impl AsrBackend for NemotronBackend {
                 model.reset();
                 *chunks_since_decoder_reset = 0;
                 replay_buffer.clear();
+                #[cfg(feature = "diarization")]
+                {
+                    speech_ended = true;
+                }
+            }
+
+            #[cfg(feature = "diarization")]
+            if let (Some(diarizer), Some(attribution)) = (diarizer.as_mut(), attribution.as_mut()) {
+                // VAD gating means the diarizer hears nothing more until the
+                // next utterance, so its horizon would stall here and leave
+                // this one's tail provisional through the pause. Diarize the
+                // tail now; the clock and speaker ids carry on.
+                if speech_ended {
+                    let uptime_ms = ctx.session.uptime_ms();
+                    match diarizer.flush() {
+                        Ok(step) => {
+                            log_diarize(diag, uptime_ms, "speech_end", diarizer, &step);
+                            attribution.add_segments(step.spans());
+                        }
+                        Err(message) => report_diarizer_error(diag, uptime_ms, &message),
+                    }
+                }
+                let keep_from = replay_buffer.oldest_start().unwrap_or(*samples_consumed);
+                out.extend(attribution.finalize_until(diarizer.horizon(), keep_from));
             }
         }
         if asr_consumed > 0 {
@@ -607,6 +691,27 @@ impl AsrBackend for NemotronBackend {
         }
 
         Ok(out)
+    }
+}
+
+/// The update for non-empty text from samples `[start, start + len)`: final
+/// and unlabelled without a diarizer, as Nemotron has always emitted it;
+/// otherwise provisional until the diarizer has labelled that range.
+fn text_update(
+    attribution: Option<&mut attribution::Attribution>,
+    segment_id: u64,
+    start: u64,
+    len: usize,
+    text: String,
+) -> TranscriptUpdate {
+    match attribution {
+        Some(attribution) => attribution.push(segment_id, start, start + len as u64, text),
+        None => TranscriptUpdate {
+            segment_id,
+            is_final: true,
+            text,
+            speaker: None,
+        },
     }
 }
 
@@ -829,32 +934,52 @@ mod tests {
     fn replay_buffer_keeps_latest_chunks() {
         let mut buffer = ReplayBuffer::new(2);
 
-        buffer.push(&[1.0]);
-        buffer.push(&[2.0]);
-        buffer.push(&[3.0]);
+        buffer.push(0, &[1.0]);
+        buffer.push(1, &[2.0]);
+        buffer.push(2, &[3.0]);
 
-        assert_eq!(buffer.snapshot(), vec![vec![2.0], vec![3.0]]);
+        assert_eq!(
+            buffer.snapshot(),
+            vec![
+                ReplayChunk {
+                    start: 1,
+                    samples: vec![2.0]
+                },
+                ReplayChunk {
+                    start: 2,
+                    samples: vec![3.0]
+                },
+            ]
+        );
+        assert_eq!(buffer.oldest_start(), Some(1));
     }
 
     #[test]
     fn replay_buffer_capacity_update_truncates_old_chunks() {
         let mut buffer = ReplayBuffer::new(3);
 
-        buffer.push(&[1.0]);
-        buffer.push(&[2.0]);
-        buffer.push(&[3.0]);
+        buffer.push(0, &[1.0]);
+        buffer.push(1, &[2.0]);
+        buffer.push(2, &[3.0]);
         buffer.update_capacity(1);
 
-        assert_eq!(buffer.snapshot(), vec![vec![3.0]]);
+        assert_eq!(
+            buffer.snapshot(),
+            vec![ReplayChunk {
+                start: 2,
+                samples: vec![3.0]
+            }]
+        );
     }
 
     #[test]
     fn replay_buffer_zero_capacity_keeps_no_chunks() {
         let mut buffer = ReplayBuffer::new(0);
 
-        buffer.push(&[1.0]);
+        buffer.push(0, &[1.0]);
 
         assert!(buffer.snapshot().is_empty());
+        assert_eq!(buffer.oldest_start(), None);
     }
 
     #[test]
@@ -864,5 +989,35 @@ mod tests {
         assert!(!caps.diarization);
         assert_eq!(caps.audio_gating, AudioGating::VadGated);
         assert_eq!(caps.activity_source, ActivitySource::Vad);
+    }
+
+    #[test]
+    fn capabilities_follow_an_active_diarizer() {
+        let mut backend = NemotronBackend::new();
+        backend.attribution = Some(attribution::Attribution::default());
+        let caps = backend.capabilities();
+        assert!(caps.revises_output);
+        assert!(caps.diarization);
+        assert_eq!(caps.audio_gating, AudioGating::VadGated);
+    }
+
+    #[test]
+    fn without_a_diarizer_text_is_final_and_unlabelled() {
+        let update = text_update(None, 7, 0, 8960, "hello".into());
+        assert_eq!(update.segment_id, 7);
+        assert!(update.is_final);
+        assert_eq!(update.text, "hello");
+        assert_eq!(update.speaker, None);
+    }
+
+    #[test]
+    fn with_a_diarizer_text_waits_for_a_label() {
+        let mut attribution = attribution::Attribution::default();
+        let update = text_update(Some(&mut attribution), 7, 8960, 8960, "hello".into());
+        assert!(!update.is_final);
+        assert!(attribution.finalize_until(17_919, 0).is_empty());
+        let finals = attribution.finalize_until(17_920, 0);
+        assert_eq!(finals.len(), 1);
+        assert_eq!(finals[0].segment_id, 7);
     }
 }

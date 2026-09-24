@@ -535,7 +535,6 @@ impl<E: EngineEventSink> AudioEngine<E> {
 
         let mut backend = asr::create_backend(&settings, cached_backend)
             .map_err(|e| Box::<dyn std::error::Error>::from(e.to_string()))?;
-        let caps = backend.capabilities();
 
         let mut vad = if let Some(mut v) = cached_vad {
             println!("Using cached VAD model (skipping reload)");
@@ -606,6 +605,10 @@ impl<E: EngineEventSink> AudioEngine<E> {
             );
             return Err(Box::<dyn std::error::Error>::from(e.to_string()));
         }
+        // Read after begin_session: what a backend can do may depend on what
+        // the session loaded (Nemotron revises and labels output only while
+        // a diarizer is running).
+        let caps = backend.capabilities();
 
         loop {
             if stop_flag.load(Ordering::Relaxed) {
