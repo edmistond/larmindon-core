@@ -267,7 +267,8 @@ fn main() -> Result<(), Box<dyn Error>> {
         eprintln!(
             "usage: replay_wav <file.wav> [--speed N] [--model PATH] [--diag PATH] \
              [--provider nemotron|soniox] [--endpoint-detection on|off] \
-             [--diarization on|off] [--empty-reset N] [--lang auto|en-US|...]"
+             [--diarization on|off] [--diarization-latency low|very_low|ultra] \
+             [--empty-reset N] [--lang auto|en-US|...]"
         );
         std::process::exit(2);
     }
@@ -281,6 +282,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut endpoint_detection: Option<bool> = None;
     let mut diarization: Option<bool> = None;
     let mut lang: Option<String> = None;
+    let mut diarization_latency: Option<String> = None;
 
     let mut i = 1;
     while i < args.len() {
@@ -315,6 +317,16 @@ fn main() -> Result<(), Box<dyn Error>> {
                 diarization = Some(parse_on_off(
                     args.get(i + 1).ok_or("--diarization needs on|off")?,
                 )?);
+                i += 2;
+            }
+            "--diarization-latency" => {
+                let preset = args
+                    .get(i + 1)
+                    .ok_or("--diarization-latency needs low|very_low|ultra")?;
+                if !settings::VALID_DIARIZATION_LATENCIES.contains(&preset.as_str()) {
+                    return Err(format!("unknown --diarization-latency {preset:?}").into());
+                }
+                diarization_latency = Some(preset.clone());
                 i += 2;
             }
             // Lowering this makes the mid-speech stuck-decoder reset (and its
@@ -372,8 +384,14 @@ fn main() -> Result<(), Box<dyn Error>> {
     if let Some(on) = endpoint_detection {
         settings.soniox_endpoint_detection = on;
     }
+    // One switch for whichever provider runs: Soniox's own diarization, or
+    // the Sortformer diarizer beside Nemotron.
     if let Some(on) = diarization {
         settings.soniox_diarization = on;
+        settings.nemotron_diarization = on;
+    }
+    if let Some(preset) = diarization_latency {
+        settings.diarization_latency = preset;
     }
     if let Some(m) = model_override {
         settings.model_path = m;

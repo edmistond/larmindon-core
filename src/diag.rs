@@ -64,6 +64,25 @@ pub struct SpeechEndRow {
     pub chunks_since_decoder_reset: u64,
 }
 
+/// One `diarize` row: a Sortformer `feed` (per live ASR chunk) or the
+/// end-of-session `flush`.
+pub struct DiarizeRow<'a> {
+    pub uptime_ms: i64,
+    /// `"feed"` or `"flush"`.
+    pub step: &'a str,
+    /// Samples fed since the session began, including this call: the clock
+    /// segment offsets are measured on.
+    pub samples_fed: u64,
+    /// Diarizer windows that ran in this call. Zero while it is buffering.
+    pub windows: u64,
+    pub inference_ms: i64,
+    pub segment_count: usize,
+    /// Distinct speakers seen so far this session.
+    pub speakers_seen: usize,
+    /// `speaker@start-end` in 16 kHz samples, space-separated.
+    pub segments: &'a str,
+}
+
 pub struct DiagSink {
     conn: Option<Connection>,
     session_id: i64,
@@ -203,6 +222,26 @@ impl DiagSink {
         );
     }
 
+    pub fn diarize(&self, r: &DiarizeRow) {
+        let Some(db) = self.live() else { return };
+        let _ = db.execute(
+            "INSERT INTO diarize (session_id, uptime_ms, step, samples_fed, windows,
+                                  inference_ms, segment_count, speakers_seen, segments)
+                                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            rusqlite::params![
+                self.session_id,
+                r.uptime_ms,
+                r.step,
+                r.samples_fed as i64,
+                r.windows as i64,
+                r.inference_ms,
+                r.segment_count as i64,
+                r.speakers_seen as i64,
+                r.segments,
+            ],
+        );
+    }
+
     pub fn shutdown(&self, uptime_ms: i64, chunk_num: u64) {
         let Some(db) = self.live() else { return };
         let _ = db.execute(
@@ -336,6 +375,19 @@ fn init_diag_db(db_path: Option<&Path>) -> Result<Option<Connection>, Box<dyn st
                  replay_audio_ms INTEGER,
                  replay_nonempty_chunks INTEGER,
                  replay_inference_ms INTEGER
+             );
+             CREATE TABLE IF NOT EXISTS diarize (
+                 id INTEGER PRIMARY KEY,
+                 session_id INTEGER,
+                 ts TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now', 'localtime')),
+                 uptime_ms INTEGER,
+                 step TEXT,
+                 samples_fed INTEGER,
+                 windows INTEGER,
+                 inference_ms INTEGER,
+                 segment_count INTEGER,
+                 speakers_seen INTEGER,
+                 segments TEXT
              );",
     )?;
     // Migrate: add columns if they don't exist (ALTER TABLE has no IF NOT EXISTS).

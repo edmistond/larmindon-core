@@ -52,6 +52,7 @@ impl EngineEventSink for MyEventSink {
 |---------|---------|-------------|
 | `cpal` | Yes | Cross-platform audio capture via CPAL |
 | `pipewire` | Yes | PipeWire audio capture (Linux only) |
+| `diarization` | Yes | Sortformer v3 speaker diarization beside Nemotron (`nemotron_diarization`, off at runtime by default) |
 | `webgpu` | No | WebGPU (Metal) execution provider for ASR |
 | `directml` | No | DirectML execution provider for ASR (Windows) |
 | `migraphx` | No | MIGraphX execution provider for ASR |

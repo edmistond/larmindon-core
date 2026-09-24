@@ -4,6 +4,13 @@
 //! speaker is always `None`. Moved out of `audio_engine.rs` unchanged — the
 //! chunking, the replay buffer and all four decoder-reset mechanisms behave
 //! exactly as they did inline.
+//!
+//! With `nemotron_diarization` on, a Sortformer diarizer is fed the same live
+//! chunks (see [`diarizer`]). Its segments are logged to diagnostics only; the
+//! transcript output is unchanged.
+
+#[cfg(feature = "diarization")]
+mod diarizer;
 
 use std::collections::VecDeque;
 use std::time::Instant;
@@ -19,6 +26,8 @@ use super::{
 use crate::diag::{
     AsrErrorRow, MidSpeechResetRow, PunctuationResetRow, SpeechEndRow, TranscribeRow,
 };
+#[cfg(feature = "diarization")]
+use crate::diag::{DiagSink, DiarizeRow};
 use crate::settings::{self, Settings, NEMOTRON_LANGUAGE_AUTO};
 use crate::vad::VadState;
 
@@ -88,6 +97,10 @@ pub struct NemotronBackend {
     /// Language in effect on a multilingual model; `None` on the English-only
     /// one, which takes no language.
     target_lang: Option<String>,
+    /// Loaded while diarization is on, and kept across sessions with the ASR
+    /// model; reloaded only if its path changes.
+    #[cfg(feature = "diarization")]
+    diarizer: Option<diarizer::Diarizer>,
 }
 
 impl NemotronBackend {
@@ -104,8 +117,66 @@ impl NemotronBackend {
             replay_buffer: ReplayBuffer::new(0),
             pending_speech_end_resets: VecDeque::new(),
             target_lang: None,
+            #[cfg(feature = "diarization")]
+            diarizer: None,
         }
     }
+
+    /// Loads, reuses or drops the diarizer to match this session's settings,
+    /// and resets its state so speaker ids start again from 0.
+    #[cfg(feature = "diarization")]
+    fn begin_diarization(&mut self, settings: &Settings) -> Result<(), AsrError> {
+        if !settings.nemotron_diarization {
+            // Frees ~380 MB; re-enabling reloads it.
+            self.diarizer = None;
+            return Ok(());
+        }
+        let path = settings::expand_tilde(&settings.diarization_model_path);
+        if self.diarizer.as_ref().is_some_and(|d| d.path() != path) {
+            self.diarizer = None;
+        }
+        let diarizer = match self.diarizer.as_mut() {
+            Some(d) => {
+                println!("Using cached diarization model (skipping reload)");
+                d
+            }
+            None => {
+                println!("Loading diarization model from {}...", path.display());
+                let d = diarizer::Diarizer::load(&path, execution_config(settings))
+                    .map_err(AsrError::Fatal)?;
+                println!("Diarization model loaded.");
+                self.diarizer.insert(d)
+            }
+        };
+        diarizer
+            .begin(diarizer::profile_for(&settings.diarization_latency))
+            .map_err(AsrError::Fatal)?;
+        println!(
+            "Diarization on, latency preset: {}",
+            settings.diarization_latency
+        );
+        Ok(())
+    }
+}
+
+/// Threads and execution provider, shared by the ASR model and the diarizer.
+fn execution_config(settings: &Settings) -> ExecutionConfig {
+    #[allow(unused_mut)]
+    let mut config = ExecutionConfig::new()
+        .with_intra_threads(settings.intra_threads)
+        .with_inter_threads(settings.inter_threads);
+
+    #[cfg(feature = "webgpu")]
+    {
+        config = config.with_execution_provider(ExecutionProvider::WebGPU);
+    }
+
+    #[cfg(feature = "directml")]
+    {
+        config = config.with_execution_provider(ExecutionProvider::DirectML);
+    }
+
+    config
 }
 
 impl Default for NemotronBackend {
@@ -148,24 +219,12 @@ impl AsrBackend for NemotronBackend {
                 settings.intra_threads,
                 settings.inter_threads
             );
-            #[allow(unused_mut)]
-            let mut model_config = ExecutionConfig::new()
-                .with_intra_threads(settings.intra_threads)
-                .with_inter_threads(settings.inter_threads);
-
             #[cfg(feature = "webgpu")]
-            {
-                println!("WebGPU feature enabled — using WebGPU (Metal) execution provider");
-                model_config = model_config.with_execution_provider(ExecutionProvider::WebGPU);
-            }
-
+            println!("WebGPU feature enabled — using WebGPU (Metal) execution provider");
             #[cfg(feature = "directml")]
-            {
-                println!("DirectML feature enabled - using DirectML execution provider");
-                model_config = model_config.with_execution_provider(ExecutionProvider::DirectML);
-            }
+            println!("DirectML feature enabled - using DirectML execution provider");
 
-            let m = Nemotron::from_pretrained(&model_path, Some(model_config))
+            let m = Nemotron::from_pretrained(&model_path, Some(execution_config(settings)))
                 .map_err(|e| AsrError::Fatal(format!("Failed to load Nemotron model: {e}")))?;
             println!("Model loaded.");
             self.model = Some(m);
@@ -222,6 +281,9 @@ impl AsrBackend for NemotronBackend {
         self.chunk_num = 0;
         self.consecutive_empty = 0;
         self.chunks_since_decoder_reset = 0;
+
+        #[cfg(feature = "diarization")]
+        self.begin_diarization(settings)?;
         Ok(())
     }
 
@@ -283,7 +345,17 @@ impl AsrBackend for NemotronBackend {
     /// Stopping mid-utterance discards whatever sits in `asr_buffer` below one
     /// chunk. That is existing behaviour and is deliberately preserved —
     /// flushing the tail here would change Nemotron's output.
-    fn end_session(&mut self, _ctx: &SessionContext) -> Result<Vec<TranscriptUpdate>, AsrError> {
+    fn end_session(&mut self, ctx: &SessionContext) -> Result<Vec<TranscriptUpdate>, AsrError> {
+        #[cfg(feature = "diarization")]
+        if let Some(diarizer) = self.diarizer.as_mut() {
+            match diarizer.flush() {
+                Ok(step) => log_diarize(ctx.diag, ctx.uptime_ms(), "flush", diarizer, &step),
+                Err(message) => report_diarizer_error(ctx.diag, ctx.uptime_ms(), &message),
+            }
+            println!("Diarization: {}", diarizer.summary());
+        }
+        #[cfg(not(feature = "diarization"))]
+        let _ = ctx;
         Ok(Vec::new())
     }
 
@@ -300,6 +372,8 @@ impl AsrBackend for NemotronBackend {
             replay_buffer,
             pending_speech_end_resets,
             target_lang: _,
+            #[cfg(feature = "diarization")]
+            diarizer,
         } = self;
 
         let model = model
@@ -481,6 +555,18 @@ impl AsrBackend for NemotronBackend {
                 }
             }
 
+            // The diarizer hears every live chunk, and only live chunks: replays
+            // above re-run old audio and would advance its clock twice. Decoder
+            // resets never touch it, so speaker ids stay stable.
+            #[cfg(feature = "diarization")]
+            if let Some(diarizer) = diarizer.as_mut() {
+                let uptime_ms = ctx.session.uptime_ms();
+                match diarizer.feed(chunk) {
+                    Ok(step) => log_diarize(diag, uptime_ms, "feed", diarizer, &step),
+                    Err(message) => report_diarizer_error(diag, uptime_ms, &message),
+                }
+            }
+
             while pending_speech_end_resets
                 .front()
                 .is_some_and(|reset| asr_consumed >= reset.reset_after_samples)
@@ -508,6 +594,34 @@ impl AsrBackend for NemotronBackend {
 
         Ok(out)
     }
+}
+
+#[cfg(feature = "diarization")]
+fn log_diarize(
+    diag: &DiagSink,
+    uptime_ms: i64,
+    step_name: &str,
+    diarizer: &diarizer::Diarizer,
+    step: &diarizer::Step,
+) {
+    diag.diarize(&DiarizeRow {
+        uptime_ms,
+        step: step_name,
+        samples_fed: diarizer.samples_fed(),
+        windows: step.windows,
+        inference_ms: step.inference_ms,
+        segment_count: step.segments.len(),
+        speakers_seen: diarizer.speakers_seen(),
+        segments: &diarizer::format_segments(&step.segments),
+    });
+}
+
+/// A failed diarizer step costs speaker labels, not captions: it is logged and
+/// the session carries on.
+#[cfg(feature = "diarization")]
+fn report_diarizer_error(diag: &DiagSink, uptime_ms: i64, message: &str) {
+    eprintln!("[asr] {message}");
+    diag.backend_error(uptime_ms, "transient", message);
 }
 
 /// Sets `requested` on a multilingual model. If parakeet-rs rejects it, falls

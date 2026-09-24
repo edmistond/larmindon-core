@@ -56,8 +56,11 @@ windows = { version = "0.62", features = [
 ] }
 
 [features]
-default = ["cpal", "pipewire", "asr-soniox"]
+default = ["cpal", "pipewire", "asr-soniox", "diarization"]
 asr-soniox = ["dep:tokio", "dep:tokio-tungstenite", "dep:futures-util"]
+# Speaker labels for Nemotron output from a Sortformer v3 (Nemotron-3
+# Diarization) model. Off at runtime unless `nemotron_diarization` is set.
+diarization = ["parakeet-rs/sortformer"]
 webgpu = ["parakeet-rs/webgpu"]
 directml = ["parakeet-rs/directml"]
 migraphx = ["parakeet-rs/migraphx"]

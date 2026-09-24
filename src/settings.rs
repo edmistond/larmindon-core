@@ -11,6 +11,10 @@ pub const VALID_ASR_PROVIDERS: &[&str] = &["nemotron", "soniox"];
 #[cfg(not(feature = "asr-soniox"))]
 pub const VALID_ASR_PROVIDERS: &[&str] = &["nemotron"];
 
+/// Sortformer streaming presets, from lowest to highest diarization accuracy:
+/// 0.32 s, 0.64 s and 1.04 s of buffer latency.
+pub const VALID_DIARIZATION_LATENCIES: &[&str] = &["ultra", "very_low", "low"];
+
 /// NVIDIA's quality tiers for Nemotron 3.5 locales, from the model card.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -103,6 +107,13 @@ pub struct Settings {
     /// Target language for a multilingual Nemotron model: `"auto"` or a code
     /// from [`NEMOTRON_LANGUAGES`]. Ignored by the English-only model.
     pub nemotron_language: String,
+    /// Label Nemotron's output with speakers from a Sortformer v3 diarizer.
+    /// Applies at the next Start. Needs the `diarization` feature.
+    pub nemotron_diarization: bool,
+    /// Sortformer v3 (Nemotron-3 Diarization) ONNX file. Tilde is expanded.
+    pub diarization_model_path: String,
+    /// Streaming preset; see [`VALID_DIARIZATION_LATENCIES`].
+    pub diarization_latency: String,
     /// Font family for transcript display. Empty string = use default.
     pub font_family: String,
     /// Font size in px for transcript display. 0 = use default.
@@ -148,6 +159,9 @@ impl fmt::Debug for Settings {
             .field("punctuation_reset", &self.punctuation_reset)
             .field("empty_reset_threshold", &self.empty_reset_threshold)
             .field("nemotron_language", &self.nemotron_language)
+            .field("nemotron_diarization", &self.nemotron_diarization)
+            .field("diarization_model_path", &self.diarization_model_path)
+            .field("diarization_latency", &self.diarization_latency)
             .field("font_family", &self.font_family)
             .field("font_size_px", &self.font_size_px)
             .field("theme_mode", &self.theme_mode)
@@ -187,6 +201,9 @@ impl Default for Settings {
             punctuation_reset: true,
             empty_reset_threshold: 6,
             nemotron_language: NEMOTRON_LANGUAGE_AUTO.to_string(),
+            nemotron_diarization: false,
+            diarization_model_path: "~/models/nemotron3_diar_v3.onnx".to_string(),
+            diarization_latency: "low".to_string(),
             font_family: String::new(),
             font_size_px: 0,
             theme_mode: "dark".to_string(),
@@ -345,6 +362,20 @@ impl Settings {
             }
         }
 
+        if let Ok(val) = std::env::var("NEMOTRON_DIARIZATION") {
+            match val.to_lowercase().as_str() {
+                "0" | "false" | "no" => {
+                    println!("Nemotron diarization DISABLED via NEMOTRON_DIARIZATION={val}");
+                    self.nemotron_diarization = false;
+                }
+                "1" | "true" | "yes" => {
+                    println!("Nemotron diarization ENABLED via NEMOTRON_DIARIZATION={val}");
+                    self.nemotron_diarization = true;
+                }
+                _ => eprintln!("Unknown NEMOTRON_DIARIZATION={val:?}, keeping saved value."),
+            }
+        }
+
         if let Ok(val) = std::env::var("SONIOX_API_KEY") {
             if val.trim().is_empty() {
                 eprintln!("SONIOX_API_KEY is empty, keeping saved value.");
@@ -413,6 +444,30 @@ impl Settings {
                 "Invalid nemotron_language '{}'; must be \"auto\" or a supported locale such as \"en-US\"",
                 self.nemotron_language
             ));
+        }
+        if !VALID_DIARIZATION_LATENCIES.contains(&self.diarization_latency.as_str()) {
+            return Err(format!(
+                "Invalid diarization_latency '{}'; must be one of {:?}",
+                self.diarization_latency, VALID_DIARIZATION_LATENCIES
+            ));
+        }
+        // Only when it would be used: the flag is kept while another provider
+        // is selected, and that must not block saving.
+        if self.nemotron_diarization && self.asr_provider == "nemotron" {
+            if !cfg!(feature = "diarization") {
+                return Err(
+                    "Nemotron diarization is not available in this build (needs the \
+                     `diarization` feature)"
+                        .to_string(),
+                );
+            }
+            let expanded = expand_tilde(&self.diarization_model_path);
+            if !expanded.is_file() {
+                return Err(format!(
+                    "Diarization model {} does not exist",
+                    expanded.display()
+                ));
+            }
         }
         if !VALID_THEMES.contains(&self.theme_mode.as_str()) {
             return Err(format!(
@@ -852,6 +907,81 @@ mod tests {
         codes.sort_unstable();
         codes.dedup();
         assert_eq!(codes.len(), 40, "duplicate code");
+    }
+
+    #[test]
+    fn nemotron_diarization_defaults_off() {
+        let s: Settings = serde_json::from_str(r#"{"chunk_ms":560}"#).unwrap();
+        assert!(!s.nemotron_diarization);
+        assert_eq!(s.diarization_latency, "low");
+        assert_eq!(s.diarization_model_path, "~/models/nemotron3_diar_v3.onnx");
+    }
+
+    #[test]
+    fn validate_rejects_unknown_diarization_latency() {
+        let s = Settings {
+            diarization_latency: "offline".to_string(),
+            ..Default::default()
+        };
+        let err = s.validate().expect_err("offline is not a live preset");
+        assert!(err.contains("diarization_latency"));
+        for ok in VALID_DIARIZATION_LATENCIES {
+            let s = Settings {
+                diarization_latency: ok.to_string(),
+                ..Default::default()
+            };
+            assert!(s.validate().is_ok(), "{ok} should be valid");
+        }
+    }
+
+    #[test]
+    fn validate_rejects_missing_diarization_model_only_when_enabled() {
+        let mut s = Settings {
+            diarization_model_path: "/definitely/not/here.onnx".to_string(),
+            ..Default::default()
+        };
+        assert!(s.validate().is_ok(), "off: path is not checked");
+        s.nemotron_diarization = true;
+        assert!(s.validate().is_err());
+    }
+
+    #[cfg(feature = "asr-soniox")]
+    #[test]
+    fn nemotron_diarization_is_not_checked_for_another_provider() {
+        let s = Settings {
+            asr_provider: "soniox".to_string(),
+            soniox_api_key: "k".to_string(),
+            nemotron_diarization: true,
+            diarization_model_path: "/definitely/not/here.onnx".to_string(),
+            ..Default::default()
+        };
+        assert!(s.validate().is_ok());
+    }
+
+    #[cfg(feature = "diarization")]
+    #[test]
+    fn validate_accepts_existing_diarization_model() {
+        let path = std::env::temp_dir().join(format!("diar_{}.onnx", std::process::id()));
+        std::fs::write(&path, b"").unwrap();
+        let s = Settings {
+            nemotron_diarization: true,
+            diarization_model_path: path.to_string_lossy().into_owned(),
+            ..Default::default()
+        };
+        let result = s.validate();
+        let _ = std::fs::remove_file(&path);
+        assert!(result.is_ok(), "{result:?}");
+    }
+
+    #[cfg(not(feature = "diarization"))]
+    #[test]
+    fn nemotron_diarization_is_rejected_without_its_feature() {
+        let s = Settings {
+            nemotron_diarization: true,
+            ..Default::default()
+        };
+        let err = s.validate().expect_err("diarization is not compiled in");
+        assert!(err.contains("diarization"));
     }
 
     #[test]

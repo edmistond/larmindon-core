@@ -45,9 +45,11 @@ fail=0
 # settings, so without this the gate silently runs whatever asr_provider
 # happens to be set to — and diffs Nemotron goldens against another backend's
 # output. That is a confusing failure precisely when you are least expecting it.
+# --diarization off for the same reason: the goldens are of the default path,
+# and a saved nemotron_diarization must not change what is being compared.
 run() {
   cargo run --release --quiet --example replay_wav -- \
-    "$@" --provider nemotron 2>/dev/null
+    "$@" --provider nemotron --diarization off 2>/dev/null
 }
 # The English fixtures pin --model only when given one, so a bare run still
 # uses the saved model_path exactly as before.
