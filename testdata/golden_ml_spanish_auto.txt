@@ -1,0 +1,50 @@
+=== EMISSIONS (23) ===
+[000]   Buenos
+[001]  días a todos
+[002] .  Hoy
+[003]  vamos a hablar
+[004]  del tiempo en
+[005]  Madrid
+[006] .  Esta mañana
+[007]  hacía frí
+[008] o, pero
+[009]  por la tarde
+[010]  la temperatura
+[011]  subió hasta
+[012]  20 grados
+[013] . 
+[014]   sabe
+[015]  si va a llover
+[016]  el fin de semana
+[017]  espero que no
+[018] , porque quiero
+[019]  ir al parque
+[020]  con mi familia
+[021] .  ¿Qué ganas te
+[022] ngo de ver el sol
+=== TRANSCRIPT ===
+  Buenos días a todos.  Hoy vamos a hablar del tiempo en Madrid.  Esta mañana hacía frío, pero por la tarde la temperatura subió hasta 20 grados.   sabe si va a llover el fin de semana espero que no, porque quiero ir al parque con mi familia.  ¿Qué ganas tengo de ver el sol
+=== SEGMENTS (23) ===
+id=1 final=true speaker=- text="  Buenos"
+id=2 final=true speaker=- text=" días a todos"
+id=3 final=true speaker=- text=".  Hoy"
+id=4 final=true speaker=- text=" vamos a hablar"
+id=5 final=true speaker=- text=" del tiempo en"
+id=6 final=true speaker=- text=" Madrid"
+id=7 final=true speaker=- text=".  Esta mañana"
+id=8 final=true speaker=- text=" hacía frí"
+id=9 final=true speaker=- text="o, pero"
+id=10 final=true speaker=- text=" por la tarde"
+id=11 final=true speaker=- text=" la temperatura"
+id=12 final=true speaker=- text=" subió hasta"
+id=13 final=true speaker=- text=" 20 grados"
+id=14 final=true speaker=- text=". "
+id=15 final=true speaker=- text="  sabe"
+id=16 final=true speaker=- text=" si va a llover"
+id=17 final=true speaker=- text=" el fin de semana"
+id=18 final=true speaker=- text=" espero que no"
+id=19 final=true speaker=- text=", porque quiero"
+id=20 final=true speaker=- text=" ir al parque"
+id=21 final=true speaker=- text=" con mi familia"
+id=22 final=true speaker=- text=".  ¿Qué ganas te"
+id=23 final=true speaker=- text="ngo de ver el sol"

@@ -22,6 +22,45 @@ bash testdata/check_regression.sh
 | `two_speaker.wav` | 75 s, 10 alternating turns across two voices, for the Soniox diarization check |
 | `two_speaker_short.wav` | 29 s, first 4 turns of the same script, for fast iteration |
 | `make_two_speaker.ps1` | Regenerates both. Windows-only; see below |
+| `spanish_speech.wav` | 14 s of Spanish (macOS `say`, voice Mónica, es_ES) for Nemotron 3.5 |
+| `make_spanish.sh` | Regenerates it. macOS-only; the output is committed |
+| `golden_ml_*.txt` | Nemotron 3.5 goldens: baseline speech with `en-US` and `auto`, Spanish with `es-ES` and `auto` |
+
+## Multilingual (Nemotron 3.5) goldens
+
+These run only when you point the gate at a 3.5 model, so the gate still works
+on a machine that has only the English one:
+
+```sh
+bash testdata/check_regression.sh --model-ml ~/models/nemotron-3.5-asr
+# or LARMINDON_MODEL_ML=~/models/nemotron-3.5-asr bash testdata/check_regression.sh
+```
+
+Each fixture is replayed with an explicit locale and with `auto`. Diffing the
+pair shows how much the language hint matters. On the current fixtures it
+changes almost nothing. English: the same words, with one chunk boundary moving
+earlier. Spanish: byte-identical.
+
+The gate first checks that the model loaded as multilingual. If
+`--model-ml` points at the English model, it fails with that message instead of
+failing every diff.
+
+`--model` pins the model for fixtures 1 and 2. Use it once `model_path` in your
+saved settings points at 3.5. Otherwise the English goldens are diffed against
+3.5 output:
+
+```sh
+bash testdata/check_regression.sh --model ~/projects/nemotron-03-2026 \
+  --model-ml ~/models/nemotron-3.5-asr
+```
+
+Things these goldens record, which are not bugs in the harness:
+
+- On the English fixture, 3.5 emits casing and commas but no sentence periods,
+  so the punctuation reset never fires there.
+- On the Spanish fixture, the question's opening word ("¿Alguien") is lost.
+  The `¿` shows up on the exclamation that follows. The loss happens with
+  `PUNCTUATION_RESET=0` too, so the punctuation reset is not the cause.
 
 ## The two-speaker fixtures
 
@@ -113,6 +152,15 @@ cargo run --release --example replay_wav -- testdata/baseline_speech.wav \
   --empty-reset 1 --diag /tmp/r.sqlite | sed -n '/=== EMISSIONS/,$p' \
   > testdata/golden_reset.txt
 python testdata/dump_diag.py /tmp/r.sqlite > testdata/golden_reset_diag.txt
+
+ML=~/models/nemotron-3.5-asr
+for pair in baseline:en-US baseline:auto spanish:es-ES spanish:auto; do
+  f=${pair%%:*}; l=${pair#*:}
+  wav=testdata/${f}_speech.wav
+  cargo run --release --example replay_wav -- $wav --provider nemotron \
+    --model $ML --lang $l | sed -n '/=== EMISSIONS/,$p' \
+    > testdata/golden_ml_${f}_$l.txt
+done
 ```
 
 ## Two traps worth knowing
