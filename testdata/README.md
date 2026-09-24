@@ -172,9 +172,9 @@ runs that backend and diffs its output against Nemotron goldens. The failure
 looks like a catastrophic transcript regression (254 emissions against 88) and
 is nothing of the sort. Do not remove that flag.
 
-It pins `--diarization off` for the same reason. A saved
-`nemotron_diarization: true` would otherwise run the Sortformer diarizer during
-the gate. Today that only adds diagnostics, but once speakers are attributed it
+It pins `--diarization off` for the same reason. `nemotron_diarization`
+defaults to on, so without the pin the gate would run the Sortformer diarizer
+whenever its model is installed. Today that only adds diagnostics, but once speakers are attributed it
 changes the emitted segments.
 
 

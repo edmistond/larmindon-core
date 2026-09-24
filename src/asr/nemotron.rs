@@ -124,14 +124,31 @@ impl NemotronBackend {
 
     /// Loads, reuses or drops the diarizer to match this session's settings,
     /// and resets its state so speaker ids start again from 0.
+    ///
+    /// Diarization is on by default, so it never fails the session: without a
+    /// usable diarizer, Nemotron runs exactly as it does with it off.
     #[cfg(feature = "diarization")]
-    fn begin_diarization(&mut self, settings: &Settings) -> Result<(), AsrError> {
+    fn begin_diarization(&mut self, ctx: &SessionContext) {
+        if let Err(message) = self.try_begin_diarization(ctx.settings) {
+            self.diarizer = None;
+            let message = format!("{message}; continuing without speaker labels");
+            eprintln!("[asr] {message}");
+            ctx.diag
+                .backend_error(ctx.uptime_ms(), "transient", &message);
+        }
+    }
+
+    #[cfg(feature = "diarization")]
+    fn try_begin_diarization(&mut self, settings: &Settings) -> Result<(), String> {
         if !settings.nemotron_diarization {
             // Frees ~380 MB; re-enabling reloads it.
             self.diarizer = None;
             return Ok(());
         }
         let path = settings::expand_tilde(&settings.diarization_model_path);
+        if !path.is_file() {
+            return Err(format!("Diarization model {} not found", path.display()));
+        }
         if self.diarizer.as_ref().is_some_and(|d| d.path() != path) {
             self.diarizer = None;
         }
@@ -142,15 +159,12 @@ impl NemotronBackend {
             }
             None => {
                 println!("Loading diarization model from {}...", path.display());
-                let d = diarizer::Diarizer::load(&path, execution_config(settings))
-                    .map_err(AsrError::Fatal)?;
+                let d = diarizer::Diarizer::load(&path, execution_config(settings))?;
                 println!("Diarization model loaded.");
                 self.diarizer.insert(d)
             }
         };
-        diarizer
-            .begin(diarizer::profile_for(&settings.diarization_latency))
-            .map_err(AsrError::Fatal)?;
+        diarizer.begin(diarizer::profile_for(&settings.diarization_latency))?;
         println!(
             "Diarization on, latency preset: {}",
             settings.diarization_latency
@@ -283,7 +297,7 @@ impl AsrBackend for NemotronBackend {
         self.chunks_since_decoder_reset = 0;
 
         #[cfg(feature = "diarization")]
-        self.begin_diarization(settings)?;
+        self.begin_diarization(ctx);
         Ok(())
     }
 
