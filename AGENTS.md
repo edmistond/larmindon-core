@@ -13,8 +13,8 @@ settings logic.
   `cargo fmt`, `cargo clippy`, `cargo check`, or `cargo test`, can be run
   directly unless they fail because dependencies are missing.
 
-- `sfw cargo fetch` currently fails on this machine with a schannel
-  `CERT_TRUST_REVOCATION_STATUS_UNKNOWN` error, because Windows cannot do a
+- On Windows, `sfw cargo fetch` can fail with a schannel
+  `CERT_TRUST_REVOCATION_STATUS_UNKNOWN` error because Windows cannot do a
   revocation lookup for the proxy's generated CA. Prefix with
   `CARGO_HTTP_CHECK_REVOKE=false` rather than dropping `sfw`; certificate
   validation still happens, only the revocation check is skipped.
