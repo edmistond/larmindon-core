@@ -120,9 +120,9 @@ pub struct NemotronBackend {
     /// one, which takes no language.
     target_lang: Option<String>,
     /// Loaded while diarization is on, and kept across sessions with the ASR
-    /// model; reloaded only if its path changes.
+    /// model; reloaded only if its path changes. Runs on its own thread.
     #[cfg(feature = "diarization")]
-    diarizer: Option<diarizer::Diarizer>,
+    diarizer: Option<diarizer::DiarizerThread>,
     /// Present exactly while a diarizer is running this session. `None` keeps
     /// the append-only output path byte for byte.
     attribution: Option<attribution::Attribution>,
@@ -192,7 +192,7 @@ impl NemotronBackend {
                 println!("Loading diarization model from {}...", path.display());
                 let d = diarizer::Diarizer::load(&path, execution_config(settings))?;
                 println!("Diarization model loaded.");
-                self.diarizer.insert(d)
+                self.diarizer.insert(diarizer::DiarizerThread::spawn(d)?)
             }
         };
         diarizer.begin(diarizer::profile_for(&settings.diarization_latency))?;
@@ -400,15 +400,11 @@ impl AsrBackend for NemotronBackend {
     fn end_session(&mut self, ctx: &SessionContext) -> Result<Vec<TranscriptUpdate>, AsrError> {
         #[cfg(feature = "diarization")]
         if let Some(diarizer) = self.diarizer.as_mut() {
-            match diarizer.flush() {
-                Ok(step) => {
-                    log_diarize(ctx.diag, ctx.uptime_ms(), "flush", diarizer, &step);
-                    if let Some(attribution) = self.attribution.as_mut() {
-                        attribution.add_segments(step.spans());
-                    }
-                }
-                Err(message) => report_diarizer_error(ctx.diag, ctx.uptime_ms(), &message),
-            }
+            let uptime_ms = ctx.uptime_ms();
+            let finished = diarizer
+                .flush("flush")
+                .and_then(|()| diarizer.wait(DIARIZER_FINISH_TIMEOUT));
+            apply_diarizer_steps(ctx.diag, uptime_ms, finished, self.attribution.as_mut());
             println!("Diarization: {}", diarizer.summary());
         }
         #[cfg(not(feature = "diarization"))]
@@ -627,15 +623,8 @@ impl AsrBackend for NemotronBackend {
             // resets never touch it, so speaker ids stay stable.
             #[cfg(feature = "diarization")]
             if let Some(diarizer) = diarizer.as_mut() {
-                let uptime_ms = ctx.session.uptime_ms();
-                match diarizer.feed(chunk) {
-                    Ok(step) => {
-                        log_diarize(diag, uptime_ms, "feed", diarizer, &step);
-                        if let Some(attribution) = attribution.as_mut() {
-                            attribution.add_segments(step.spans());
-                        }
-                    }
-                    Err(message) => report_diarizer_error(diag, uptime_ms, &message),
+                if let Err(message) = diarizer.feed(chunk) {
+                    report_diarizer_error(diag, ctx.session.uptime_ms(), &message);
                 }
             }
 
@@ -667,27 +656,32 @@ impl AsrBackend for NemotronBackend {
             }
 
             #[cfg(feature = "diarization")]
-            if let (Some(diarizer), Some(attribution)) = (diarizer.as_mut(), attribution.as_mut()) {
+            if let Some(diarizer) = diarizer.as_mut() {
                 // VAD gating means the diarizer hears nothing more until the
                 // next utterance, so its horizon would stall here and leave
                 // this one's tail provisional through the pause. Diarize the
                 // tail now; the clock and speaker ids carry on.
                 if speech_ended {
-                    let uptime_ms = ctx.session.uptime_ms();
-                    match diarizer.flush() {
-                        Ok(step) => {
-                            log_diarize(diag, uptime_ms, "speech_end", diarizer, &step);
-                            attribution.add_segments(step.spans());
-                        }
-                        Err(message) => report_diarizer_error(diag, uptime_ms, &message),
+                    if let Err(message) = diarizer.flush("speech_end") {
+                        report_diarizer_error(diag, ctx.session.uptime_ms(), &message);
                     }
                 }
-                let keep_from = replay_buffer.oldest_start().unwrap_or(*samples_consumed);
-                out.extend(attribution.finalize_until(diarizer.horizon(), keep_from));
             }
         }
         if asr_consumed > 0 {
             asr_buffer.drain(..asr_consumed);
+        }
+
+        // Once per iteration, chunks or not: labels finished during a pause
+        // must still settle the text waiting on them.
+        #[cfg(feature = "diarization")]
+        if let Some(diarizer) = diarizer.as_mut() {
+            let finished = diarizer.poll();
+            apply_diarizer_steps(diag, ctx.session.uptime_ms(), finished, attribution.as_mut());
+            if let Some(attribution) = attribution.as_mut() {
+                let keep_from = replay_buffer.oldest_start().unwrap_or(*samples_consumed);
+                out.extend(attribution.finalize_until(diarizer.effective_horizon(), keep_from));
+            }
         }
 
         Ok(out)
@@ -715,22 +709,50 @@ fn text_update(
     }
 }
 
+/// How long `end_session` waits for the diarizer to label the last audio.
+#[cfg(feature = "diarization")]
+const DIARIZER_FINISH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Logs each finished diarizer step and hands its segments to attribution.
+#[cfg(feature = "diarization")]
+fn apply_diarizer_steps(
+    diag: &DiagSink,
+    uptime_ms: i64,
+    finished: Result<Vec<diarizer::Stepped>, String>,
+    mut attribution: Option<&mut attribution::Attribution>,
+) {
+    let steps = match finished {
+        Ok(steps) => steps,
+        Err(message) => return report_diarizer_error(diag, uptime_ms, &message),
+    };
+    for stepped in steps {
+        match &stepped.result {
+            Ok(step) => {
+                log_diarize(diag, uptime_ms, &stepped, step);
+                if let Some(attribution) = attribution.as_deref_mut() {
+                    attribution.add_segments(step.spans());
+                }
+            }
+            Err(message) => report_diarizer_error(diag, uptime_ms, message),
+        }
+    }
+}
+
 #[cfg(feature = "diarization")]
 fn log_diarize(
     diag: &DiagSink,
     uptime_ms: i64,
-    step_name: &str,
-    diarizer: &diarizer::Diarizer,
+    stepped: &diarizer::Stepped,
     step: &diarizer::Step,
 ) {
     diag.diarize(&DiarizeRow {
         uptime_ms,
-        step: step_name,
-        samples_fed: diarizer.samples_fed(),
+        step: stepped.step,
+        samples_fed: stepped.samples_fed,
         windows: step.windows,
         inference_ms: step.inference_ms,
         segment_count: step.segments.len(),
-        speakers_seen: diarizer.speakers_seen(),
+        speakers_seen: stepped.speakers_seen,
         segments: &diarizer::format_segments(&step.segments),
     });
 }
