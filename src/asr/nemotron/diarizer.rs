@@ -8,11 +8,19 @@
 //!
 //! Segments go to [`super::attribution`], which labels Nemotron's text with
 //! them once [`Diarizer::horizon`] has passed it.
+//!
+//! The model runs on its own thread behind [`DiarizerThread`]. Inline on the
+//! processing thread, a diarizer slower than real time (a debug build, a busy
+//! machine) stalled Nemotron until the capture buffer dropped seconds of
+//! audio. Off-thread, the same slowness only delays labels, and
+//! [`DiarizerThread::effective_horizon`] bounds that delay.
 
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use parakeet_rs::sortformer::{
     DiarizationConfig, Sortformer, SpeakerSegment, StreamingProfile, SUBSAMPLING,
@@ -197,6 +205,235 @@ fn advance(buffered: &mut u64, diarized: &mut u64, fed: u64, stride: u64, window
         windows += 1;
     }
     windows
+}
+
+/// Audio the labels may trail the ASR by before text is finalized with the
+/// best label available, so a diarizer that cannot keep up costs accuracy
+/// rather than leaving captions provisional indefinitely.
+const MAX_LABEL_LAG_SAMPLES: u64 = 10 * 16_000;
+
+enum Request {
+    Begin(StreamingProfile),
+    Feed(Vec<f32>),
+    Flush(&'static str),
+}
+
+enum Reply {
+    Begun(Result<(), String>),
+    Stepped(Stepped),
+}
+
+/// A `feed` or `flush` the worker has finished, with the counters the
+/// diagnostics row reads as they stood right after it.
+pub(super) struct Stepped {
+    /// `"feed"`, or the name the flush was requested under.
+    pub step: &'static str,
+    pub result: Result<Step, String>,
+    pub samples_fed: u64,
+    pub speakers_seen: usize,
+    /// Requests this reply answers: consecutive feeds are coalesced.
+    requests: usize,
+    horizon: u64,
+    summary: String,
+}
+
+/// A [`Diarizer`] on its own thread. Calls never block on inference except
+/// [`DiarizerThread::begin`] and [`DiarizerThread::wait`].
+pub(super) struct DiarizerThread {
+    requests: Sender<Request>,
+    replies: Receiver<Reply>,
+    path: PathBuf,
+    /// Samples sent this session: the ASR's clock.
+    sent: u64,
+    /// The worker's horizon as of its latest reply.
+    horizon: u64,
+    in_flight: usize,
+    summary: String,
+    stopped: bool,
+}
+
+impl DiarizerThread {
+    pub fn spawn(diarizer: Diarizer) -> Result<Self, String> {
+        let path = diarizer.path().to_path_buf();
+        let (requests, worker_requests) = mpsc::channel();
+        let (worker_replies, replies) = mpsc::channel();
+        thread::Builder::new()
+            .name("diarizer".to_string())
+            .spawn(move || run_worker(diarizer, worker_requests, worker_replies))
+            .map_err(|e| format!("Failed to start diarization thread: {e}"))?;
+        Ok(Self {
+            requests,
+            replies,
+            path,
+            sent: 0,
+            horizon: 0,
+            in_flight: 0,
+            summary: String::new(),
+            stopped: false,
+        })
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// [`Diarizer::begin`] on the worker. Blocks for the answer, discarding
+    /// anything the previous session left in flight.
+    pub fn begin(&mut self, profile: StreamingProfile) -> Result<(), String> {
+        self.send(Request::Begin(profile))?;
+        loop {
+            match self.replies.recv() {
+                Ok(Reply::Begun(result)) => break result?,
+                Ok(Reply::Stepped(_)) => {}
+                Err(_) => return Err(self.stop()),
+            }
+        }
+        self.sent = 0;
+        self.horizon = 0;
+        self.in_flight = 0;
+        self.summary.clear();
+        Ok(())
+    }
+
+    pub fn feed(&mut self, samples: &[f32]) -> Result<(), String> {
+        self.sent += samples.len() as u64;
+        self.send(Request::Feed(samples.to_vec()))?;
+        self.in_flight += 1;
+        Ok(())
+    }
+
+    pub fn flush(&mut self, step: &'static str) -> Result<(), String> {
+        self.send(Request::Flush(step))?;
+        self.in_flight += 1;
+        Ok(())
+    }
+
+    /// Steps finished since the last call. Never blocks.
+    pub fn poll(&mut self) -> Result<Vec<Stepped>, String> {
+        let mut done = Vec::new();
+        loop {
+            match self.replies.try_recv() {
+                Ok(reply) => self.accept(reply, &mut done),
+                Err(TryRecvError::Empty) => return Ok(done),
+                Err(TryRecvError::Disconnected) => return Err(self.stop()),
+            }
+        }
+    }
+
+    /// Like [`DiarizerThread::poll`], then waits up to `timeout` for every
+    /// request sent so far. For session end, where a short wait beats
+    /// finalizing text without a label.
+    pub fn wait(&mut self, timeout: Duration) -> Result<Vec<Stepped>, String> {
+        let mut done = self.poll()?;
+        let deadline = Instant::now() + timeout;
+        while self.in_flight > 0 {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            match self.replies.recv_timeout(remaining) {
+                Ok(reply) => self.accept(reply, &mut done),
+                Err(RecvTimeoutError::Timeout) => break,
+                Err(RecvTimeoutError::Disconnected) => return Err(self.stop()),
+            }
+        }
+        Ok(done)
+    }
+
+    /// How far text may be finalized: the diarizer's horizon, or the point
+    /// [`MAX_LABEL_LAG_SAMPLES`] behind the ASR if labels trail further than
+    /// that. Unbounded once the worker has stopped.
+    pub fn effective_horizon(&self) -> u64 {
+        if self.stopped {
+            return u64::MAX;
+        }
+        self.horizon
+            .max(self.sent.saturating_sub(MAX_LABEL_LAG_SAMPLES))
+    }
+
+    pub fn summary(&self) -> &str {
+        &self.summary
+    }
+
+    fn accept(&mut self, reply: Reply, done: &mut Vec<Stepped>) {
+        if let Reply::Stepped(stepped) = reply {
+            self.in_flight = self.in_flight.saturating_sub(stepped.requests);
+            self.horizon = stepped.horizon;
+            self.summary.clone_from(&stepped.summary);
+            done.push(stepped);
+        }
+    }
+
+    fn send(&mut self, request: Request) -> Result<(), String> {
+        if self.requests.send(request).is_err() {
+            return Err(self.stop());
+        }
+        Ok(())
+    }
+
+    fn stop(&mut self) -> String {
+        self.stopped = true;
+        "Diarization thread stopped".to_string()
+    }
+}
+
+/// Owns the model. Consecutive queued feeds are coalesced into one call, so a
+/// worker that falls behind catches up in fewer, larger passes; Sortformer
+/// buffers internally, so the segments are the same either way. Exits when
+/// the [`DiarizerThread`] is dropped.
+fn run_worker(mut diarizer: Diarizer, requests: Receiver<Request>, replies: Sender<Reply>) {
+    let mut next = None;
+    loop {
+        let request = match next.take() {
+            Some(request) => request,
+            None => match requests.recv() {
+                Ok(request) => request,
+                Err(_) => return,
+            },
+        };
+        let reply = match request {
+            Request::Begin(profile) => Reply::Begun(diarizer.begin(profile)),
+            Request::Feed(mut audio) => {
+                let mut coalesced = 1;
+                loop {
+                    match requests.try_recv() {
+                        Ok(Request::Feed(more)) => {
+                            audio.extend_from_slice(&more);
+                            coalesced += 1;
+                        }
+                        Ok(other) => {
+                            next = Some(other);
+                            break;
+                        }
+                        Err(_) => break,
+                    }
+                }
+                let result = diarizer.feed(&audio);
+                Reply::Stepped(stepped(&diarizer, "feed", result, coalesced))
+            }
+            Request::Flush(step) => {
+                let result = diarizer.flush();
+                Reply::Stepped(stepped(&diarizer, step, result, 1))
+            }
+        };
+        if replies.send(reply).is_err() {
+            return;
+        }
+    }
+}
+
+fn stepped(
+    diarizer: &Diarizer,
+    step: &'static str,
+    result: Result<Step, String>,
+    requests: usize,
+) -> Stepped {
+    Stepped {
+        step,
+        result,
+        samples_fed: diarizer.samples_fed(),
+        speakers_seen: diarizer.speakers_seen(),
+        requests,
+        horizon: diarizer.horizon(),
+        summary: diarizer.summary(),
+    }
 }
 
 /// `speaker@start-end` per segment, space-separated, for the diagnostics row.
